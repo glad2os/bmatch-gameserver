@@ -27,7 +27,7 @@ async function startGameServer(app, options, consul, redisClient, rabbitMQChanne
         openedBubble(io, socket, consul, redisClient, rabbitMQChannel);
         chatMessage(io, socket, consul, redisClient);
         ping(socket, io);
-        userPause(io, socket, consul, redisClient);
+        userPause(io, socket, consul, redisClient, rabbitMQChannel);
     });
 
     await setupRabbitMQ(rabbitMQChannel);

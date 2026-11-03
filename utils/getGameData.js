@@ -162,7 +162,7 @@ async function setNextPlayer(redisClient, consul, gameUUID, currentUser) {
 
     let currentIndex;
     if (currentUser.type === "Bot") {
-        currentIndex = currentGamePlayers.findIndex(bot => bot.username === currentUser.username);
+        currentIndex = currentGamePlayers.findIndex(bot => bot.id === currentUser.id);
     } else {
         currentIndex = currentGamePlayers.findIndex(player => player.id == currentUser.UserId);
     }
@@ -241,59 +241,44 @@ async function getGameWebSocketsGuestsFromRedis(redisClient, gameUUID) {
 
 async function linkUserWithWebSocket(redisClient, gameUUID, wsId) {
     await redisClient.hSet(`GameWS:${wsId}`, "gameUUID", gameUUID);
+    await redisClient.expire(`GameWS:${wsId}`, 6 * 60 * 60);
 }
 
 async function getGameUUIDByGameWS(redisClient, wsId) {
     return await redisClient.hGet(`GameWS:${wsId}`, `gameUUID`);
 }
 
-async function removeTimer(redisClient, gameUUID) {
-    await redisClient.del(`Game:${gameUUID}:Timer`, (err) => {
-        if (err) console.error(`Failed to delete key Game:${gameUUID}:Timer`);
-    });
-}
-
 async function setTimer(rabbitMQChannel, redisClient, gameUUID, duration = 30) {
-    const exchangeName = "game_events";
-    const message = JSON.stringify({
-        gameUUID: gameUUID,
-        ttl: duration * 1000
+    const key = `Game:${gameUUID}`;
+    if (!await redisClient.exists(key) || await redisClient.hGet(key, 'GameOver')) return;
+    const turnId = await redisClient.hIncrBy(key, 'TurnId', 1);
+    const timerKey = `${key}:TimerStart`;
+    await redisClient.hSet(timerKey, {TimerStart: String(Date.now()), TimerDuration: String(duration)});
+    // A timer must not outlive its game, including the end-of-game grace period.
+    const ttl = await redisClient.ttl(key);
+    await redisClient.expire(timerKey, ttl > 0 ? ttl : 6 * 60 * 60);
+    rabbitMQChannel.publish('game_timer_delayed', 'fire', Buffer.from(JSON.stringify({gameUUID, turnId})), {
+        persistent: true, headers: {'x-delay': Math.max(1, Math.ceil(duration * 1000))}
     });
-
-    await rabbitMQChannel.publish(exchangeName, "game.timer.set", Buffer.from(message));
-    await rabbitMQChannel.bindQueue("game_timer", exchangeName, "game.timer.set");
-
-    await redisClient.hSet(`Game:${gameUUID}:TimerStart`, "Time", Date.now().toString());
 }
 
-async function getRemainingTime(redisClient, gameUUID, initialDuration = 30) {
-    const timerStart = await redisClient.hGet(`Game:${gameUUID}:TimerStart`, "Time");
-
-    if(timerStart === 0) return 0;
-
-    if (!timerStart) return initialDuration;
-
-    const elapsedTime = (Date.now() - timerStart) / 1000;
-    const remainingTime = initialDuration - elapsedTime;
-
-    return remainingTime > 0 ? remainingTime : 0;
+async function getRemainingTime(redisClient, gameUUID) {
+    const timer = await redisClient.hGetAll(`Game:${gameUUID}:TimerStart`);
+    const start = Number(timer.TimerStart);
+    const duration = Number(timer.TimerDuration);
+    if (!start || !duration) return 0;
+    return Math.max(0, duration - (Date.now() - start) / 1000);
 }
 
 async function cancelTimer(redisClient, rabbitMQChannel, gameUUID) {
-    const message = await rabbitMQChannel.get("game_timer");
-
-    if (message) {
-        const content = JSON.parse(message.content.toString());
-
-        if (content.gameUUID === gameUUID) {
-            rabbitMQChannel.nack(message, false, true);
-            await redisClient.hSet(`Game:${gameUUID}:TimerStart`, "Time", 0);
-        } else {
-            rabbitMQChannel.ack(message);
-        }
+    const key = `Game:${gameUUID}`;
+    if (!await redisClient.exists(key)) return;
+    await redisClient.hIncrBy(key, 'TurnId', 1);
+    const timerKey = `${key}:TimerStart`;
+    if (await redisClient.exists(timerKey)) {
+        await redisClient.hSet(timerKey, 'TimerDuration', '0');
     }
 }
-
 
 async function updateUsersWSAtLobbyData(redisClient, lobbyData, userFromJWT, socketId, gameUUID) {
     lobbyData.userWS = lobbyData.userWS || [];
@@ -305,6 +290,7 @@ async function updateUsersWSAtLobbyData(redisClient, lobbyData, userFromJWT, soc
         lobbyData.userWS.push({id: userFromJWT.id, ws: socketId});
     }
 
+    lobbyData.readyPlayers = lobbyData.userWS.length;
     await redisClient.hSet(`Game:${gameUUID}`, 'LobbyData', JSON.stringify(lobbyData));
 }
 

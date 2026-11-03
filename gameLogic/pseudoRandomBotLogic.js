@@ -68,6 +68,7 @@ async function performBotActions(io, redisClient, consul, data, rabbitMQChannel)
     let nextPlayer = await getCurrentGamePlayer(redisClient, data.gameUUID);
 
     while (nextPlayer.type === "Bot") {
+        await redisClient.expire(`Game:${data.gameUUID}:BotRunning`, 120);
         let botAp = await getActionPointer(redisClient, data.gameUUID);
         let chCellBotAction = await getAction(redisClient, data.gameUUID, botAp);
 
@@ -97,12 +98,6 @@ async function performBotActions(io, redisClient, consul, data, rabbitMQChannel)
 
         let botLastAction = await getAction(redisClient, data.gameUUID, botActionPointer);
 
-        if (botLastAction && botLastAction.openBubbles.length === 100) {
-            await setPaused(redisClient, data.gameUUID, 'true');
-            await endGame(io, redisClient, rabbitMQChannel, consul, data.gameUUID);
-            return;
-        }
-
         let previousOpenBubbles = botLastAction ? botLastAction.openBubbles : [];
 
         let incrementedBotActionPointer = ++botActionPointer;
@@ -128,7 +123,9 @@ async function performBotActions(io, redisClient, consul, data, rabbitMQChannel)
             nextTry = true;
         }
 
+        botAction.requestedBubbles = {};
         await setAction(redisClient, data.gameUUID, incrementedBotActionPointer, botAction);
+        io.to(data.gameUUID).emit('gameAction', botAction);
 
         if (!nextTry) {
             nextPlayer = await setNextPlayer(redisClient, consul, data.gameUUID, nextPlayer);
