@@ -41,14 +41,18 @@ function join(io, socket, consul, redisClient) {
             await setUserSocket(redisClient, socket.id, lobbyId)
 
             if (data.type === "Bot") {
-                if (lobbyData.players !== 4) {
+                const admin = await extractAndVerifyJWT(data.token, consul, redisClient);
+                if (!lobbyData.players.some(player => player.id === admin.id && player.type === "Admin")) {
+                    throw new Error("Only the lobby admin can add bots");
+                }
+                if (lobbyData.players.length < 4) {
                     let lobbyProperties = checkLobbyProperties(lobbyData.players);
                     let botId = lobbyProperties.bots.length;
 
                     lobbyData.players.push({
-                        id: botId++,
+                        id: `bot-${botId}`,
                         mmr: 0,
-                        username: `Bot${botId++}`,
+                        username: `Bot${botId}`,
                         type: "Bot",
                         lastSuccessfulAttempt: 0
                     })
@@ -57,6 +61,7 @@ function join(io, socket, consul, redisClient) {
                     await emitPlayerListToLobby(io, redisClient, lobbyId);
                     return;
                 }
+                throw new Error("Lobby is full");
             }
 
             let currentUser = await extractAndVerifyJWT(data.token, consul, redisClient);
@@ -75,7 +80,8 @@ function join(io, socket, consul, redisClient) {
             const existingPlayerIndex = lobbyData.players.findIndex(player => player.id === currentUser.id);
 
             if (existingPlayerIndex === -1) {
-                let playerType = lobbyId.startsWith(currentUser.username) ? "Admin" : "Player";
+                if (lobbyData.players.length >= 4) throw new Error("Lobby is full");
+                let playerType = lobbyId.split('#')[0] === currentUser.username ? "Admin" : "Player";
 
                 lobbyData.players.push({
                     id: currentUser.id,
@@ -89,11 +95,6 @@ function join(io, socket, consul, redisClient) {
                 io.to(oldWebsocketId).emit("userExist");
                 await redisClient.del(`Socket:${oldWebsocketId}`);
                 lobbyData.players[existingPlayerIndex].ws = socket.id;
-            }
-
-            if (lobbyData.players.length === 4) {
-                await emitPlayerListToLobby(io, redisClient, lobbyId);
-                return;
             }
 
             await setLobbyPlayersData(redisClient, lobbyId, lobbyData.players)
