@@ -1,3 +1,4 @@
+const {withGameLock} = require("../utils/gameLock");
 const {verify} = require("jsonwebtoken");
 const {JWTToken, getPostgresConfig} = require("../config/config");
 const {fetchUserById, setStatusById, getStatusById} = require("../utils/getPostgresqlUserData");
@@ -113,25 +114,28 @@ function join(io, socket, consul, redisClient) {
 function disconnectLobby(io, socket, redisClient) {
     socket.on('disconnect', async () => {
         try {
-            let lobbyId = await getLobbyFromWsSocket(socket.id, redisClient);
-            if (lobbyId == null) return;
-
-            let lobbyData = await fetchLobbyDataAndPlayers(redisClient, lobbyId);
-            let excludeCurrentSocketId = lobbyData.players.filter(player => player.ws !== socket.id);
-
-            let lobbyProperties = checkLobbyProperties(excludeCurrentSocketId);
-
-            if (!lobbyProperties.hasPlayers || !lobbyProperties.hasNoRealPlayersOrAdmin || lobbyProperties.hasNoAdmin) {
-                io.to(lobbyId).emit('lobbyRemoved');
-                await redisClient.del(`Lobby:${lobbyId}`);
-            } else {
-                await setLobbyPlayersData(redisClient, lobbyId, excludeCurrentSocketId)
-                await emitPlayerListToLobby(io, redisClient, lobbyId);
-            }
-
+            const lobbyId = await getLobbyFromWsSocket(socket.id, redisClient);
+            if (!lobbyId) return;
+            const {players} = await fetchLobbyDataAndPlayers(redisClient, lobbyId);
+            const player = players.find(player => player.ws === socket.id);
             await redisClient.del(`Socket:${socket.id}`);
-        } catch (err) {
-            console.error('Error handling disconnect:', err);
+            if (!player) return;
+            setTimeout(() => withGameLock(`lobby:${lobbyId}`, async () => {
+                const lobby = await fetchLobbyDataAndPlayers(redisClient, lobbyId);
+                const current = lobby.players.find(item => item.id === player.id);
+                if (!current || current.ws !== socket.id) return;
+                const remaining = lobby.players.filter(item => item.id !== player.id);
+                const properties = checkLobbyProperties(remaining);
+                if (!properties.hasPlayers || properties.hasNoRealPlayersOrAdmin || properties.hasNoAdmin) {
+                    io.to(lobbyId).emit('lobbyRemoved');
+                    await redisClient.del(`Lobby:${lobbyId}`);
+                } else {
+                    await setLobbyPlayersData(redisClient, lobbyId, remaining);
+                    await emitPlayerListToLobby(io, redisClient, lobbyId);
+                }
+            }).catch(error => console.error('Error handling lobby disconnect:', error)), 10000).unref();
+        } catch (error) {
+            console.error('Error handling lobby disconnect:', error);
         }
     });
 }

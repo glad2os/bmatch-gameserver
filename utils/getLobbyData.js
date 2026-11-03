@@ -13,7 +13,7 @@ function checkLobbyProperties(players) {
     const hasPlayers = players.length > 0;
     const isFull = players.length === 4;
     const hasNoAdmin = players.every(player => player.type !== "Admin");
-    const hasNoRealPlayersOrAdmin = players.every(player => player.type !== "Player" || player.type !== "Admin");
+    const hasNoRealPlayersOrAdmin = players.every(player => player.type !== "Player" && player.type !== "Admin");
     const realPlayersOrAdminIds = players.filter(player => player.type === "Player" || player.type === "Admin").map(player => player.id);
     const bots = players.filter(player => player.type === "Bot");
 
