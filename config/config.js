@@ -10,6 +10,9 @@ const consulPort = process.env.CONSUL_PORT || '8500';
 
 const JWTToken = process.env.JWT_TOKEN || 'YourSecretKeyShouldBeVerySecureAndNotPublic';
 
+// A game with no human move for this long is treated as abandoned and ended on the next turn timeout.
+const idleGameTimeoutMs = Number(process.env.GAME_IDLE_TIMEOUT_SECONDS || 300) * 1000;
+
 const getPostgresConfig = async (consul) => {
     let production = await consul.catalog.service.nodes('postgres');
     let postgreSQL = production[0];
@@ -64,5 +67,5 @@ const getRedisConfig = async (consul) => {
 };
 
 module.exports = {
-    user: postgreSQLUser, password: postgreSQLPassword, database: postgreSQLDatabase, consulHost, consulPort, getPostgresConfig, getRedisConfig, JWTToken, getRabbitMQConfig
+    user: postgreSQLUser, password: postgreSQLPassword, database: postgreSQLDatabase, consulHost, consulPort, getPostgresConfig, getRedisConfig, JWTToken, getRabbitMQConfig, idleGameTimeoutMs
 };

@@ -2,9 +2,10 @@ const {test} = require('node:test');
 const assert = require('node:assert/strict');
 const {sign} = require('jsonwebtoken');
 const {Pool} = require('pg');
-const {JWTToken} = require('../config/config');
+const {JWTToken, idleGameTimeoutMs} = require('../config/config');
 const {joinLobby, generateGame} = require('../sockets/lobbyws');
-const {openedBubble, userPause, joinServer, disconnectServer, listenForExpiredMessages} = require('../sockets/gamews');
+const {openedBubble, userPause, joinServer, disconnectServer, listenForExpiredMessages, chatMessage} = require('../sockets/gamews');
+const {withGameLock} = require('../utils/gameLock');
 const {setTimer, getRemainingTime} = require('../utils/getGameData');
 const {endGame} = require('../utils/endGameHandler');
 const {handleUserAuthentication} = require('../utils/userAuth');
@@ -127,22 +128,86 @@ test('pause rejects spectators, stops timer, resumes remainder and uses per-user
     assert.equal(JSON.parse(await e.redis.hGet('Game:game', 'GameUserPaused')).paused, 'true');
 });
 
-test('stale timers are ignored and repeated idle turns end game exactly once', async () => {
+test('stale timers are ignored; timeouts skip turns until the game has been idle for the limit', async () => {
     const e = environment(); await e.game(); await e.user(1); await e.user(2);
     let acks = 0; e.channel.ack = () => acks++;
     await listenForExpiredMessages(e.io, e.redis, e.channel, e.consul);
-    await setTimer(e.channel, e.redis, 'game', 30);
-    await e.channel.consumer({content: Buffer.from(JSON.stringify({gameUUID: 'game', turnId: 0}))});
-    assert.equal(await e.redis.hGet('Game:game', 'IdleTimeouts'), null);
-    for (let i = 0; i < 4; i++) {
+    const fire = async () => {
         const turnId = Number(await e.redis.hGet('Game:game', 'TurnId'));
         await e.channel.consumer({content: Buffer.from(JSON.stringify({gameUUID: 'game', turnId}))});
-    }
+    };
+    await e.redis.hSet('Game:game', 'LastMoveAt', String(Date.now()));
+    await setTimer(e.channel, e.redis, 'game', 30);
+    await e.channel.consumer({content: Buffer.from(JSON.stringify({gameUUID: 'game', turnId: 0}))});
+    assert.equal(await e.redis.hGet('Game:game', 'LastActionId'), '0');
+    // Recent human activity: every timeout only skips the turn.
+    for (let i = 0; i < 6; i++) await fire();
+    assert.equal(await e.redis.hGet('Game:game', 'GameOver'), null);
+    assert.equal(await e.redis.hGet('Game:game', 'LastActionId'), '6');
+    // No human move for longer than the limit: the next timeout ends the game.
+    await e.redis.hSet('Game:game', 'LastMoveAt', String(Date.now() - idleGameTimeoutMs - 1000));
+    await fire();
     await endGame(e.io, e.redis, e.channel, e.consul, 'game');
-    assert.equal(acks, 5);
+    assert.equal(acks, 8);
     assert.equal(await e.redis.hGet('Game:game', 'GameOver'), '1');
     assert.equal(e.events.filter(event => event.name === 'gameOver').length, 1);
     assert.equal(e.ttls.get('Game:game'), 600);
+});
+
+test('chat is delivered while the game lock is held', async () => {
+    const e = environment(); await e.game();
+    const token = await e.user(1); const guestToken = await e.user(3);
+    await e.redis.hSet('Game:game', 'PlayersSockets', JSON.stringify(['ws1']));
+    const socket = e.socket('ws1'); const guest = e.socket('guest');
+    chatMessage(e.io, socket, e.consul, e.redis);
+    chatMessage(e.io, guest, e.consul, e.redis);
+    let release;
+    const held = withGameLock('game', () => new Promise(resolve => { release = resolve; }));
+    await socket.handlers.chatMessage({gameUUID: 'game', token, message: 'hi', username: 'spoofed'});
+    const message = e.events.find(event => event.name === 'receiveMessage');
+    assert.deepEqual(message, {target: 'ws1', name: 'receiveMessage', value: {message: 'hi', username: 'player1'}});
+    await guest.handlers.chatMessage({gameUUID: 'game', token: guestToken, message: 'hi'});
+    assert.equal(e.events.at(-1).value.username, 'System');
+    release(); await held;
+});
+
+test('bot turn runs in the background and does not hold the game lock between clicks', async () => {
+    const e = environment(); await e.game(); await e.user(1);
+    const bot = {id: 'bot-0', username: 'Bot0', type: 'Bot', lastSuccessfulAttempt: 0};
+    await e.redis.hSet('Game:game', {
+        LobbyData: JSON.stringify({players: [1], bots: [bot], readyPlayers: 1}),
+        // Bubble i has image i + 1, so every bot pick misses and the turn passes back to player 1.
+        GameArea: JSON.stringify(Array.from({length: 100}, (_, i) => i + 1)),
+        LastMoveAt: String(Date.now())
+    });
+    const published = [];
+    e.channel.publish = (exchange, route, content) => published.push(JSON.parse(content));
+    await listenForExpiredMessages(e.io, e.redis, e.channel, e.consul);
+    await setTimer(e.channel, e.redis, 'game', 30);
+
+    // Player 1 times out; the handler hands the turn to the bot and returns without waiting for it.
+    const started = Date.now();
+    await e.channel.consumer({content: Buffer.from(JSON.stringify(published.at(-1)))});
+    assert.ok(Date.now() - started < 500);
+    assert.equal(JSON.parse(await e.redis.hGet('Game:game', 'CurrentPlayer')).type, 'Bot');
+    assert.equal(await e.redis.hGet('Game:game', 'GamePaused'), 'true');
+
+    // While the bot plays, other handlers get the lock almost immediately.
+    await new Promise(resolve => setTimeout(resolve, 1200));
+    const lockStarted = Date.now();
+    await withGameLock('game', async () => {});
+    assert.ok(Date.now() - lockStarted < 200);
+
+    const deadline = Date.now() + 10000;
+    while (JSON.parse(await e.redis.hGet('Game:game', 'CurrentPlayer')).type === 'Bot' && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    await withGameLock('game', async () => {});
+    assert.equal(JSON.parse(await e.redis.hGet('Game:game', 'CurrentPlayer')).id, 1);
+    assert.equal(await e.redis.hGet('Game:game', 'GamePaused'), 'false');
+    assert.equal(await e.redis.exists('Game:game:BotRunning'), 0);
+    assert.equal(published.length, 2);
+    assert.ok(e.events.some(event => event.name === 'closeBubbles'));
 });
 
 test('guests receive action zero and disconnect removes socket tracking', async () => {

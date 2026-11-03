@@ -198,6 +198,7 @@ function generateGame(io, socket, redisClient, consul) {
                 }));
 
                 await redisClient.hSet(`Game:${uuid}`, `GamePaused`, 'true');
+                await redisClient.hSet(`Game:${uuid}`, 'LastMoveAt', String(Date.now()));
 
                 await redisClient.expire(`Game:${uuid}`, 6 * 60 * 60);
 

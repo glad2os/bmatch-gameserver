@@ -1,17 +1,18 @@
 const {
     getLobbyData, getGamePlayers, getCurrentGamePlayer, setCurrentGamePlayer,
-    getReadyPlayers, getActionPointer, getUserFromRedisByUserId, getGameArea,
+    getReadyPlayers, getActionPointer, getGameArea,
     setAction, setActionPointer, getAction, setPaused, getPaused, setNextPlayer,
     emitOpenBubbles, emitCloseBubbles, getGameWebSocketsFromRedis,
     getGameUUIDByGameWS, setTimer, getUserPaused, setUserPaused,
     getRemainingTime, cancelTimer, linkUserWithWebSocket, addGameWebSocketsGuestsToRedis
 } = require('../utils/getGameData');
-const {emitSystemMessage} = require('../utils/getLobbyData');
+const {emitSystemMessage, extractAndVerifyJWT} = require('../utils/getLobbyData');
 const {performBotActions} = require('../gameLogic/pseudoRandomBotLogic');
 const {handleUserAuthentication} = require('../utils/userAuth');
 const {endGame} = require('../utils/endGameHandler');
 const {validateMove} = require('../gameLogic/validateMove');
 const {withGameLock} = require('../utils/gameLock');
+const {idleGameTimeoutMs} = require('../config/config');
 
 async function setupRabbitMQ(channel) {
     await channel.assertExchange('game_timer_delayed', 'x-delayed-message', {
@@ -34,12 +35,15 @@ async function finishIfComplete(io, redisClient, channel, consul, uuid) {
     return !await isActive(redisClient, uuid);
 }
 
-// Called only while holding the game lock. The lease also covers recovery after a restart.
+const botRunningKey = uuid => `Game:${uuid}:BotRunning`;
+
+// Called only while holding the game lock. Bot turns are started in the background and take the
+// lock only for their own state changes; the lease also covers recovery after a restart.
 async function continueTurn(io, redisClient, channel, consul, uuid) {
     if (await finishIfComplete(io, redisClient, channel, consul, uuid)) return;
-    let player = await getCurrentGamePlayer(redisClient, uuid);
+    const player = await getCurrentGamePlayer(redisClient, uuid);
     if (player?.type === 'Bot') {
-        const key = `Game:${uuid}:BotRunning`;
+        const key = botRunningKey(uuid);
         if (!await redisClient.set(key, '1', {NX: true, EX: 120})) {
             const ttl = await redisClient.ttl(key);
             setTimeout(() => withGameLock(uuid, async () => {
@@ -52,20 +56,32 @@ async function continueTurn(io, redisClient, channel, consul, uuid) {
         }
         await cancelTimer(redisClient, channel, uuid);
         await setPaused(redisClient, uuid, 'true');
-        try {
-            await performBotActions(io, redisClient, consul, {gameUUID: uuid}, channel);
-        } finally {
-            await redisClient.del(key);
-            if (await isActive(redisClient, uuid)) await setPaused(redisClient, uuid, 'false');
-        }
-        if (await finishIfComplete(io, redisClient, channel, consul, uuid)) return;
-        player = await getCurrentGamePlayer(redisClient, uuid);
+        runBotTurns(io, redisClient, channel, consul, uuid);
+        return;
     }
-    if (player && player.type !== 'Bot') {
+    if (player) {
         await setPaused(redisClient, uuid, 'false');
         await setTimer(channel, redisClient, uuid, 30);
         io.to(uuid).emit('timeRequested', 30);
     }
+}
+
+// Runs outside the game lock; hands the turn back to a human (or ends the game) when bots finish.
+async function runBotTurns(io, redisClient, channel, consul, uuid) {
+    let failed = false;
+    try {
+        await performBotActions(io, redisClient, consul, {gameUUID: uuid}, channel, action => withGameLock(uuid, action));
+    } catch (error) {
+        failed = true;
+        console.error('Bot turn failed:', error);
+    }
+    await withGameLock(uuid, async () => {
+        await redisClient.del(botRunningKey(uuid));
+        if (!await isActive(redisClient, uuid)) return;
+        // After a failure, leave the game paused on the bot; the next join retries the turn.
+        if (failed) return;
+        await continueTurn(io, redisClient, channel, consul, uuid);
+    }).catch(error => console.error('Failed to finish bot turn:', error));
 }
 
 async function listenForExpiredMessages(io, redisClient, channel, consul) {
@@ -82,9 +98,11 @@ async function listenForExpiredMessages(io, redisClient, channel, consul) {
                 const pointer = await getActionPointer(redisClient, uuid);
                 const action = await getAction(redisClient, uuid, pointer);
                 if (!current || current.type === 'Bot' || !action) return;
-                const lobby = await getLobbyData(redisClient, uuid);
-                const idle = await redisClient.hIncrBy(`Game:${uuid}`, 'IdleTimeouts', 1);
-                if (idle >= 2 * lobby.players.length) {
+                // End abandoned games: no human move for idleGameTimeoutMs.
+                const lastMoveAt = Number(await redisClient.hGet(`Game:${uuid}`, 'LastMoveAt'));
+                if (!lastMoveAt) {
+                    await redisClient.hSet(`Game:${uuid}`, 'LastMoveAt', String(Date.now()));
+                } else if (Date.now() - lastMoveAt >= idleGameTimeoutMs) {
                     await endGame(io, redisClient, channel, consul, uuid);
                     return;
                 }
@@ -99,7 +117,10 @@ async function listenForExpiredMessages(io, redisClient, channel, consul) {
                     io.to(uuid).emit('currentPlayer', next);
                     await continueTurn(io, redisClient, channel, consul, uuid);
                 } finally {
-                    if (await isActive(redisClient, uuid)) await setPaused(redisClient, uuid, 'false');
+                    // A started bot turn keeps the game paused until it hands the turn back.
+                    if (await isActive(redisClient, uuid) && !await redisClient.exists(botRunningKey(uuid))) {
+                        await setPaused(redisClient, uuid, 'false');
+                    }
                 }
             });
         } catch (error) {
@@ -192,7 +213,7 @@ function openedBubble(io, socket, consul, redisClient, channel) {
                     openBubbles: [...lastAction.openBubbles], requestedBubbles: bubble,
                     sender: current, serverTime: new Date().toISOString()
                 };
-                await redisClient.hSet(`Game:${uuid}`, 'IdleTimeouts', '0');
+                await redisClient.hSet(`Game:${uuid}`, 'LastMoveAt', String(Date.now()));
                 current.actionPoints = points - 1;
                 let miss = false;
                 if (points === 1) {
@@ -236,18 +257,17 @@ function chatMessage(io, socket, consul, redisClient) {
     socket.on('chatMessage', async (data = {}) => {
         if (!data.gameUUID || typeof data.message !== 'string' || data.message.length < 1 || data.message.length > 64) return;
         try {
-            await withGameLock(data.gameUUID, async () => {
-                if (!await isActive(redisClient, data.gameUUID)) return;
-                const auth = await handleUserAuthentication(io, data, socket, redisClient, consul);
-                if (!auth) {
-                    io.to(socket.id).emit('receiveMessage', {message: 'nobody hears you ;(', username: 'System'});
-                    return;
-                }
-                const user = await getUserFromRedisByUserId(redisClient, consul, auth.UserId);
-                for (const id of await getGameWebSocketsFromRedis(redisClient, data.gameUUID)) {
-                    io.to(id).emit('receiveMessage', {message: data.message, username: user.username});
-                }
-            });
+            // Read-only, so it does not take the game lock and is not delayed by bot turns.
+            if (!await isActive(redisClient, data.gameUUID)) return;
+            const user = await extractAndVerifyJWT(data.token, consul, redisClient);
+            const lobby = await getLobbyData(redisClient, data.gameUUID);
+            if (!lobby.players.includes(user.id)) {
+                io.to(socket.id).emit('receiveMessage', {message: 'nobody hears you ;(', username: 'System'});
+                return;
+            }
+            for (const id of await getGameWebSocketsFromRedis(redisClient, data.gameUUID)) {
+                io.to(id).emit('receiveMessage', {message: data.message, username: user.username});
+            }
         } catch (error) {
             emitSystemMessage(io, socket, error.message);
         }
