@@ -1,7 +1,7 @@
 const {withGameLock} = require("../utils/gameLock");
 const {getPostgresConfig} = require("../config/config");
 const {setStatusById, getStatusById} = require("../utils/getPostgresqlUserData");
-const {v4: uuidv4} = require('uuid');
+const {randomUUID} = require('node:crypto');
 const {generateArea} = require('../gameLogic/areaGenerator')
 const {
     extractAndVerifyJWT,
@@ -175,7 +175,7 @@ function generateGame(io, socket, redisClient, consul) {
                     throw new Error("Game is already created");
                 }
 
-                let uuid = uuidv4();
+                let uuid = randomUUID();
 
                 await redisClient.hSet(`Lobby:${lobbyId}`, 'UUID', JSON.stringify({
                     uuid: uuid,
