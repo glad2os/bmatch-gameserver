@@ -14,7 +14,7 @@ const {
     getLobbyFromWsSocket,
     getLobbyUUID
 } = require("../utils/getLobbyData");
-const {getUserJWTCache} = require("../utils/getGameData");
+
 
 function join(io, socket, consul, redisClient) {
     socket.on('join', async (data) => {
@@ -73,8 +73,12 @@ function join(io, socket, consul, redisClient) {
             let currentStatus = await getStatusById(currentUser.id, cfg);
 
             if (currentStatus === "IN_GAME") {
-                let userData = await getUserJWTCache(redisClient, data.token);
-                throw new Error(`The user is already in Game: ${userData.UUID}`);
+                const uuid = await redisClient.get(`UserGame:${currentUser.id}`);
+                if (uuid && await redisClient.exists(`Game:${uuid}`) &&
+                    !await redisClient.hGet(`Game:${uuid}`, 'GameOver')) {
+                    throw new Error(`The user is already in Game: ${uuid}`);
+                }
+                await setStatusById(currentUser.id, "REGISTERED", cfg);
             }
 
             const existingPlayerIndex = lobbyData.players.findIndex(player => player.id === currentUser.id);
@@ -196,15 +200,15 @@ function generateGame(io, socket, redisClient, consul) {
 
             await redisClient.hSet(`Game:${uuid}`, `GamePaused`, 'true');
 
-            io.to(lobbyId).emit("gameUUID", {
-                uuid: uuid
-            });
+            await redisClient.expire(`Game:${uuid}`, 6 * 60 * 60);
 
             const cfg = await getPostgresConfig(consul);
 
             for (const it of lobbyProperties.realPlayersOrAdminIds) {
-                await setStatusById(it, "IN_GAME", cfg)
+                await redisClient.set(`UserGame:${it}`, uuid, {EX: 6 * 60 * 60});
+                await setStatusById(it, "IN_GAME", cfg);
             }
+            io.to(lobbyId).emit("gameUUID", {uuid});
         } catch (ex) {
             let data = JSON.stringify({
                 message: ex.message
