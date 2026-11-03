@@ -1,7 +1,6 @@
 const postgreSQLUser = process.env.POSTGRES_USER || 'bmatch';
 const postgreSQLPassword = process.env.POSTGRES_PASSWORD || 'newpassword';
 const postgreSQLDatabase = process.env.POSTGRES_DB || 'bmatch';
-const isProduction = process.env.IS_PROD || 'false';
 
 const rabbitMQUser = process.env.RABBITMQ_USER || 'bmatch';
 const rabbitMQPassword = process.env.RABBITMQ_PASSWORD || 'newpassword';
@@ -17,22 +16,12 @@ const getPostgresConfig = async (consul) => {
 
     if (postgreSQL === undefined) {
         console.log("postgres service not found in consul");
-        process.exit(0);
+        process.exit(1);
     }
 
-    if (isProduction == 'true'){
-        return {
-            host: postgreSQL.ServiceAddress,
-            port: postgreSQL.ServicePort,
-            user: postgreSQLUser,
-            password: postgreSQLPassword,
-            database: postgreSQLDatabase
-        };
-
-    }
 
     return {
-        host: postgreSQL.Address,
+        host: postgreSQL.ServiceAddress || postgreSQL.Address,
         port: postgreSQL.ServicePort,
         user: postgreSQLUser,
         password: postgreSQLPassword,
@@ -46,20 +35,12 @@ const getRabbitMQConfig = async (consul) => {
 
     if (consulNode === undefined) {
         console.log("RabbitMQ service not found in consul");
-        process.exit(0);
+        process.exit(1);
     }
 
-    if (isProduction == 'true'){
-        return {
-            host: consulNode.ServiceAddress,
-            port: consulNode.ServicePort,
-            user: rabbitMQUser,
-            pass: rabbitMQPassword
-        };
-    }
 
     return {
-        host: consulNode.Address,
+        host: consulNode.ServiceAddress || consulNode.Address,
         port: consulNode.ServicePort,
         user: rabbitMQUser,
         pass: rabbitMQPassword
@@ -71,19 +52,13 @@ const getRedisConfig = async (consul) => {
     let consulNode = production[0];
 
     if (consulNode === undefined) {
-        console.log("consul service not found in consul");
-        process.exit(0);
+        console.log("Redis service not found in consul");
+        process.exit(1);
     }
 
-    if (isProduction == 'true'){
-        return {
-            host: consulNode.ServiceAddress,
-            port: consulNode.ServicePort
-        };
-    }
 
     return {
-        host: consulNode.Address,
+        host: consulNode.ServiceAddress || consulNode.Address,
         port: consulNode.ServicePort
     };
 };
