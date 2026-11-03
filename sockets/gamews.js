@@ -1,3 +1,4 @@
+const {validateMove} = require("../gameLogic/validateMove");
 const {
     getLobbyData,
     getGamePlayers,
@@ -227,7 +228,7 @@ function disconnectServer(io, socket, redisClient, consul) {
 function openedBubble(io, socket, consul, redisClient, rabbitMQChannel) {
     socket.on('sendOpenedBubble', async (data) => {
         try {
-            if (!data.bubbleId || !data.token || !data.gameUUID) return;
+            if (data.bubbleId === undefined || data.bubbleId === null || !data.token || !data.gameUUID) return;
 
             const isPaused = await getPaused(redisClient, data.gameUUID);
             const isUserPaused = await getUserPaused(redisClient, data.gameUUID)
@@ -251,12 +252,12 @@ function openedBubble(io, socket, consul, redisClient, rabbitMQChannel) {
                 return;
             }
 
-            await setPaused(redisClient, data.gameUUID, 'true');
-
             let actionPointer = await getActionPointer(redisClient, data.gameUUID);
 
             let lastAction = await getAction(redisClient, data.gameUUID, actionPointer);
 
+            if (!validateMove(data.bubbleId, lastAction, currentGamePlayer.actionPoints)) return;
+            await setPaused(redisClient, data.gameUUID, 'true');
             let gameArea = await getGameArea(redisClient, data.gameUUID);
 
             let action = {
