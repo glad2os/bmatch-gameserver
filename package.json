@@ -2,8 +2,12 @@
   "name": "bmatch-server",
   "version": "0.0.0",
   "private": true,
+  "engines": {
+    "node": "18.x"
+  },
   "scripts": {
-    "start": "node ./app.js"
+    "start": "node ./app.js",
+    "test": "node --test"
   },
   "dependencies": {
     "amqplib": "^0.10.3",
