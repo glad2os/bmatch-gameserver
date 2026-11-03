@@ -43,7 +43,10 @@ async function continueTurn(io, redisClient, channel, consul, uuid) {
         if (!await redisClient.set(key, '1', {NX: true, EX: 120})) {
             const ttl = await redisClient.ttl(key);
             setTimeout(() => withGameLock(uuid, async () => {
-                if (await isActive(redisClient, uuid)) await continueTurn(io, redisClient, channel, consul, uuid);
+                if (await isActive(redisClient, uuid) &&
+                    (await getCurrentGamePlayer(redisClient, uuid))?.type === 'Bot') {
+                    await continueTurn(io, redisClient, channel, consul, uuid);
+                }
             }).catch(console.error), Math.max(1, ttl + 1) * 1000).unref();
             return;
         }
