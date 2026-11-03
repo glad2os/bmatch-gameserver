@@ -1,49 +1,21 @@
-const { Client } = require('pg');
-
-const fetchUserById = async (userId, config) => {
-    const client = new Client(config);
-    try {
-        await client.connect();
-        const res = await client.query('SELECT * FROM users WHERE id = $1', [userId]);
-        return res.rows[0];
-    } catch (err) {
-        throw err;
-    } finally {
-        await client.end();
+const {Pool} = require('pg');
+let pool;
+function getPool(config) {
+    if (!pool) {
+        pool = new Pool(config);
+        pool.on('error', error => console.error('PostgreSQL pool error:', error));
     }
-};
-
-
-const setStatusById = async (userId, status, config) => {
-    const client = new Client(config);
-    try {
-        await client.connect();
-        const queryText = 'UPDATE users SET status = $1 WHERE id = $2';
-        await client.query(queryText, [status, userId]);
-    } catch (err) {
-        throw err;
-    } finally {
-        await client.end();
-    }
-};
-
-
-const getStatusById = async (userId, config) => {
-    const client = new Client(config);
-    try {
-        await client.connect();
-        const queryText = 'SELECT status FROM users WHERE id = $1';
-        const res = await client.query(queryText, [userId]);
-        return res.rows[0].status;
-    } catch (err) {
-        throw err;
-    } finally {
-        await client.end();
-    }
-};
-
-module.exports = {
-    fetchUserById,
-    setStatusById,
-    getStatusById
-};
+    return pool;
+}
+async function fetchUserById(userId, config) {
+    const result = await getPool(config).query('SELECT id, username, mmr FROM users WHERE id = $1', [userId]);
+    return result.rows[0];
+}
+async function setStatusById(userId, status, config) {
+    await getPool(config).query('UPDATE users SET status = $1 WHERE id = $2', [status, userId]);
+}
+async function getStatusById(userId, config) {
+    const result = await getPool(config).query('SELECT status FROM users WHERE id = $1', [userId]);
+    return result.rows[0]?.status ?? null;
+}
+module.exports = {fetchUserById, setStatusById, getStatusById};

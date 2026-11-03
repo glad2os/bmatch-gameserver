@@ -2,7 +2,7 @@ const https = require('https');
 const { Server } = require("socket.io");
 const { joinLobby, disconnectLobby, generateGame } = require("./../sockets/lobbyws");
 const http = require("http");
-const useTLS = process.env.USE_TLS;
+const useTLS = process.env.USE_TLS === 'true';
 
 function startLobbyServer(app, options, consul, redisClient) {
     const server = useTLS

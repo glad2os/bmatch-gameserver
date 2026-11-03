@@ -1,26 +1,27 @@
-const {setPaused, cancelTimer, getGameJWTFromRedis} = require("./getGameData");
+const {setPaused, cancelTimer, getLobbyData} = require("./getGameData");
 const {getPostgresConfig} = require("../config/config");
-const {extractAndVerifyJWT} = require("./getLobbyData");
 const {setStatusById} = require("./getPostgresqlUserData");
 
 async function endGame(io, redisClient, rabbitMQChannel, consul, gameUUID) {
+    const key = `Game:${gameUUID}`;
+    if (!await redisClient.exists(key) || !await redisClient.hSetNX(key, 'GameOver', '1')) return;
     await setPaused(redisClient, gameUUID, 'true');
-    io.to(gameUUID).emit('gameOver');
     await cancelTimer(redisClient, rabbitMQChannel, gameUUID);
-
-    let userJWTs = await getGameJWTFromRedis(redisClient, gameUUID);
-    await processJWTs(userJWTs, consul, redisClient);
-}
-
-async function processJWTs(userJWTs, consul, redisClient) {
-    let cfg = await getPostgresConfig(consul);
-
-    for (let userJWT of userJWTs) {
-        let currentUser = await extractAndVerifyJWT(userJWT, consul, redisClient);
-        await setStatusById(currentUser.id, "REGISTERED", cfg);
+    await redisClient.expire(key, 600);
+    await redisClient.expire(`${key}:TimerStart`, 600);
+    io.to(gameUUID).emit('gameOver');
+    const lobby = await getLobbyData(redisClient, gameUUID);
+    for (const id of lobby.players) {
+        try {
+            await setStatusById(id, "REGISTERED", await getPostgresConfig(consul));
+        } catch (error) {
+            console.error(`Failed to reset status for user ${id}:`, error);
+        }
+        // Do not remove a mapping created by a subsequent game.
+        if (await redisClient.get(`UserGame:${id}`) === gameUUID) {
+            await redisClient.del(`UserGame:${id}`);
+        }
     }
 }
 
-module.exports = {
-    endGame
-}
+module.exports = {endGame};

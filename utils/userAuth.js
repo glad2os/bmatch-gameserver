@@ -34,7 +34,7 @@ async function handleUserAuthentication(io, data, socket, redisClient, consul) {
     await addGameWebSocketsToRedis(redisClient, data.gameUUID, socket.id);
     await addGameJWTsToRedis(redisClient, data.gameUUID, data.token);
 
-    return currentUser;
+    return {UUID: data.gameUUID, Socket: socket.id, UserId: userFromJWT.id};
 }
 
 async function authenticateNewUser(io, data, socket, redisClient, consul) {
@@ -60,7 +60,7 @@ async function authenticateNewUser(io, data, socket, redisClient, consul) {
     const cfg = await getPostgresConfig(consul);
     await setStatusById(userFromJWT.id, "IN_GAME",cfg)
 
-    return userFromJWT.id;
+    return {UUID: data.gameUUID, Socket: socket.id, UserId: userFromJWT.id};
 }
 
 module.exports = {

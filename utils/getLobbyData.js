@@ -1,32 +1,19 @@
 const {getPostgresConfig, JWTToken} = require("../config/config");
-const {fetchUserById} = require("./getPostgresqlUserData");
+const {getCachedUserProfile} = require("./userProfileCache");
 const {verify} = require("jsonwebtoken");
 
 async function extractAndVerifyJWT(jwt, consul, redisClient) {
     const verifyPlayer = verify(jwt, JWTToken);
     const userId = verifyPlayer.sub;
 
-    const userProfileKey = `user_profile:${userId}`;
-
-    let userProfile = await redisClient.get(userProfileKey);
-
-    if (userProfile) {
-        userProfile = JSON.parse(userProfile);
-    } else {
-        const cfg = await getPostgresConfig(consul);
-        userProfile = await fetchUserById(userId, cfg);
-
-        await redisClient.set(userProfileKey, JSON.stringify(userProfile), 'EX', 3600);
-    }
-
-    return userProfile;
+    return getCachedUserProfile(redisClient, consul, userId);
 }
 
 function checkLobbyProperties(players) {
     const hasPlayers = players.length > 0;
     const isFull = players.length === 4;
     const hasNoAdmin = players.every(player => player.type !== "Admin");
-    const hasNoRealPlayersOrAdmin = players.every(player => player.type !== "Player" || player.type !== "Admin");
+    const hasNoRealPlayersOrAdmin = players.every(player => player.type !== "Player" && player.type !== "Admin");
     const realPlayersOrAdminIds = players.filter(player => player.type === "Player" || player.type === "Admin").map(player => player.id);
     const bots = players.filter(player => player.type === "Bot");
 

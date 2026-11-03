@@ -7,13 +7,11 @@ const {
     getGameArea,
     emitOpenBubbles,
     setBotLastSuccessfulAttempt,
-    setPaused,
     setActionPointer,
     emitCloseBubbles,
     setAction,
-    setNextPlayer, cancelTimer, setTimer
+    setNextPlayer
 } = require("../utils/getGameData");
-const {endGame} = require("../utils/endGameHandler");
 
 function pseudoRandomChoice(lastSuccessfulAttempt) {
     const C = 0.05;
@@ -64,76 +62,79 @@ function randomSleep(min, max) {
     return new Promise(resolve => setTimeout(resolve, Math.random() * (max - min) + min));
 }
 
-async function performBotActions(io, redisClient, consul, data, rabbitMQChannel) {
-    let nextPlayer = await getCurrentGamePlayer(redisClient, data.gameUUID);
+// runLocked wraps each state read/write in the game lock; the sleeps between bot clicks
+// run outside it so chat, joins and reconnects are not blocked for the whole bot turn.
+async function performBotActions(io, redisClient, consul, data, rabbitMQChannel, runLocked = action => action()) {
+    const gameKey = `Game:${data.gameUUID}`;
 
-    while (nextPlayer.type === "Bot") {
-        let botAp = await getActionPointer(redisClient, data.gameUUID);
-        let chCellBotAction = await getAction(redisClient, data.gameUUID, botAp);
+    // Returns the bot that still owns the turn, or null when the game ended or the turn moved on.
+    async function currentBot(expectedId) {
+        if (!await redisClient.exists(gameKey) || await redisClient.hGet(gameKey, 'GameOver')) return null;
+        const player = await getCurrentGamePlayer(redisClient, data.gameUUID);
+        if (!player || player.type !== "Bot" || (expectedId !== undefined && player.id !== expectedId)) return null;
+        return player;
+    }
 
-        if (chCellBotAction.openBubbles.length === 100) {
-            console.log(chCellBotAction.openBubbles.length);
-            return;
-        }
-
-        let nextTry = false;
-
+    while (true) {
         await randomSleep(1000, 2000);
 
-        let gameArea = await getGameArea(redisClient, data.gameUUID);
+        const move = await runLocked(async () => {
+            const bot = await currentBot();
+            if (!bot) return null;
+            await redisClient.expire(`${gameKey}:BotRunning`, 120);
 
-        const [botSelect1, newLastSuccessfulAttempt1] = chooseCell(chCellBotAction.openBubbles, gameArea, nextPlayer.lastSuccessfulAttempt);
-        const [botSelect2, newLastSuccessfulAttempt2] = chooseCell(chCellBotAction.openBubbles, gameArea, newLastSuccessfulAttempt1, gameArea[Number(botSelect1)], botSelect1);
+            const lastAction = await getAction(redisClient, data.gameUUID, await getActionPointer(redisClient, data.gameUUID));
+            if (!lastAction || lastAction.openBubbles.length === 100) return null;
+
+            const gameArea = await getGameArea(redisClient, data.gameUUID);
+            const [select1, attempt1] = chooseCell(lastAction.openBubbles, gameArea, bot.lastSuccessfulAttempt);
+            const [select2, attempt2] = chooseCell(lastAction.openBubbles, gameArea, attempt1, gameArea[Number(select1)], select1);
+            return {bot, gameArea, select1: Number(select1), select2: Number(select2), attempt: attempt2};
+        });
+        if (!move) return;
+
+        const {bot, gameArea, select1, select2} = move;
+        const isPair = gameArea[select1] === gameArea[select2];
 
         await randomSleep(200, 1000);
-        await emitOpenBubbles(io, data.gameUUID, Number(botSelect1), Number(gameArea[Number(botSelect1)]));
+        await emitOpenBubbles(io, data.gameUUID, select1, Number(gameArea[select1]));
 
         await randomSleep(200, 1000);
-        await emitOpenBubbles(io, data.gameUUID, Number(botSelect2), Number(gameArea[Number(botSelect2)]));
+        await emitOpenBubbles(io, data.gameUUID, select2, Number(gameArea[select2]));
 
-        await setBotLastSuccessfulAttempt(redisClient, data.gameUUID, nextPlayer.id, newLastSuccessfulAttempt2);
-
-        let botActionPointer = await getActionPointer(redisClient, data.gameUUID);
-
-        let botLastAction = await getAction(redisClient, data.gameUUID, botActionPointer);
-
-        if (botLastAction && botLastAction.openBubbles.length === 100) {
-            await setPaused(redisClient, data.gameUUID, 'true');
-            await endGame(io, redisClient, rabbitMQChannel, consul, data.gameUUID);
-            return;
-        }
-
-        let previousOpenBubbles = botLastAction ? botLastAction.openBubbles : [];
-
-        let incrementedBotActionPointer = ++botActionPointer;
-        await setActionPointer(redisClient, data.gameUUID, incrementedBotActionPointer);
-
-        let botAction = {
-            openBubbles: [...previousOpenBubbles], requestedBubbles: [{
-                bubbleId: Number(botSelect1), bubbleImg: Number(gameArea[Number(botSelect1)])
-            }, {
-                bubbleId: Number(botSelect2), bubbleImg: Number(gameArea[Number(botSelect2)])
-            }], sender: nextPlayer, serverTime: new Date().toISOString()
-        }
-
-        if (gameArea[botSelect1] !== gameArea[botSelect2]) {
+        if (!isPair) {
             await randomSleep(1000, 2000);
-
-            await emitCloseBubbles(io, data.gameUUID, Number(botSelect1), Number(botSelect2))
-        } else {
-            botAction.openBubbles.push({bubbleId: botSelect1, bubbleImg: gameArea[botSelect1]}, {
-                bubbleId: botSelect2, bubbleImg: gameArea[botSelect2]
-            });
-
-            nextTry = true;
+            await emitCloseBubbles(io, data.gameUUID, select1, select2);
         }
 
-        await setAction(redisClient, data.gameUUID, incrementedBotActionPointer, botAction);
+        const keepsTurn = await runLocked(async () => {
+            if (!await currentBot(bot.id)) return false;
 
-        if (!nextTry) {
-            nextPlayer = await setNextPlayer(redisClient, consul, data.gameUUID, nextPlayer);
+            await setBotLastSuccessfulAttempt(redisClient, data.gameUUID, bot.id, move.attempt);
+
+            const pointer = await getActionPointer(redisClient, data.gameUUID);
+            const lastAction = await getAction(redisClient, data.gameUUID, pointer);
+            const botAction = {
+                openBubbles: [...(lastAction ? lastAction.openBubbles : [])],
+                requestedBubbles: {}, sender: bot, serverTime: new Date().toISOString()
+            };
+            if (isPair) {
+                botAction.openBubbles.push({bubbleId: select1, bubbleImg: gameArea[select1]}, {
+                    bubbleId: select2, bubbleImg: gameArea[select2]
+                });
+            }
+
+            await setAction(redisClient, data.gameUUID, pointer + 1, botAction);
+            await setActionPointer(redisClient, data.gameUUID, pointer + 1);
+            io.to(data.gameUUID).emit('gameAction', botAction);
+
+            if (isPair) return botAction.openBubbles.length < 100;
+
+            const nextPlayer = await setNextPlayer(redisClient, consul, data.gameUUID, bot);
             io.to(data.gameUUID).emit('currentPlayer', nextPlayer);
-        }
+            return nextPlayer.type === "Bot";
+        });
+        if (!keepsTurn) return;
     }
 }
 

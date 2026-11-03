@@ -36,13 +36,12 @@ const initializeServices = async () => {
         url: `redis://${redisHost.host}:${redisHost.port}/`,
     });
 
-    await redisClient.connect();
-
     redisClient.on('error', err => console.log('Redis Client Error', err));
+    await redisClient.connect();
 
     const rabbitMQConnection  = await connect(`amqp://${rabbitMQConfig.user}:${rabbitMQConfig.pass}@${rabbitMQConfig.host}:${rabbitMQConfig.port}`);
     const rabbitMQChannel  = await rabbitMQConnection.createChannel();
-    console.log(`Connection to amqp://${rabbitMQConfig.user}:${rabbitMQConfig.pass}@${rabbitMQConfig.host}:${rabbitMQConfig.port}`)
+    console.log(`Connected to RabbitMQ at ${rabbitMQConfig.host}:${rabbitMQConfig.port}`)
 
     startLobbyServer(app, options, consul, redisClient);
     await startGameServer(app, options, consul, redisClient, rabbitMQChannel);

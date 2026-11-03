@@ -1,2 +1,5 @@
 node_modules
-tls
+build
+.gradle
+.git
+.env

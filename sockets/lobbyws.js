@@ -1,7 +1,7 @@
-const {verify} = require("jsonwebtoken");
-const {JWTToken, getPostgresConfig} = require("../config/config");
-const {fetchUserById, setStatusById, getStatusById} = require("../utils/getPostgresqlUserData");
-const {v4: uuidv4} = require('uuid');
+const {withGameLock} = require("../utils/gameLock");
+const {getPostgresConfig} = require("../config/config");
+const {setStatusById, getStatusById} = require("../utils/getPostgresqlUserData");
+const {randomUUID} = require('node:crypto');
 const {generateArea} = require('../gameLogic/areaGenerator')
 const {
     extractAndVerifyJWT,
@@ -14,91 +14,98 @@ const {
     getLobbyFromWsSocket,
     getLobbyUUID
 } = require("../utils/getLobbyData");
-const {getUserJWTCache} = require("../utils/getGameData");
+
 
 function join(io, socket, consul, redisClient) {
-    socket.on('join', async (data) => {
+    socket.on('join', async (data = {}) => {
         let lobbyId = data.lobbyID;
 
         if (lobbyId === undefined) {
             return;
         }
 
-        socket.join(lobbyId);
-
         try {
-            let cfg = await getPostgresConfig(consul);
-            let lobbyData = await fetchLobbyDataAndPlayers(redisClient, lobbyId);
+            await withGameLock(`lobby:${lobbyId}`, async () => {
+                let cfg = await getPostgresConfig(consul);
+                let lobbyData = await fetchLobbyDataAndPlayers(redisClient, lobbyId);
 
-            let lobbyUUID = await getLobbyUUID(redisClient, lobbyId);
+                if (data.type === "Bot") {
+                    const admin = await extractAndVerifyJWT(data.token, consul, redisClient);
+                    if (!lobbyData.players.some(player => player.id === admin.id && player.type === "Admin")) {
+                        throw new Error("Only the lobby admin can add bots");
+                    }
+                    if (lobbyData.players.length < 4) {
+                        let lobbyProperties = checkLobbyProperties(lobbyData.players);
+                        let botId = lobbyProperties.bots.length;
 
-            if (lobbyUUID !== null) {
-                io.to(lobbyId).emit("gameUUID", {
-                    uuid: JSON.parse(lobbyUUID).uuid
-                });
-            }
+                        lobbyData.players.push({
+                            id: `bot-${botId}`,
+                            mmr: 0,
+                            username: `Bot${botId}`,
+                            type: "Bot",
+                            lastSuccessfulAttempt: 0
+                        })
 
-            await setUserSocket(redisClient, socket.id, lobbyId)
+                        await setLobbyPlayersData(redisClient, lobbyId, lobbyData.players)
+                        await emitPlayerListToLobby(io, redisClient, lobbyId);
+                        return;
+                    }
+                    throw new Error("Lobby is full");
+                }
 
-            if (data.type === "Bot") {
-                if (lobbyData.players !== 4) {
-                    let lobbyProperties = checkLobbyProperties(lobbyData.players);
-                    let botId = lobbyProperties.bots.length;
+                let currentUser = await extractAndVerifyJWT(data.token, consul, redisClient);
+
+                if (!currentUser.id) {
+                    throw new Error("Not able to parse user-id");
+                }
+
+                const existingUUID = await getLobbyUUID(redisClient, lobbyId);
+                if (existingUUID) {
+                    const game = JSON.parse(existingUUID);
+                    if (await redisClient.exists(`Game:${game.uuid}`) &&
+                        !await redisClient.hGet(`Game:${game.uuid}`, 'GameOver')) {
+                        if (!lobbyData.players.some(player => player.id === currentUser.id)) throw new Error("Lobby is full");
+                        io.to(socket.id).emit('gameUUID', game);
+                        return;
+                    }
+                    await redisClient.hDel(`Lobby:${lobbyId}`, 'UUID');
+                }
+                let currentStatus = await getStatusById(currentUser.id, cfg);
+
+                if (currentStatus === "IN_GAME") {
+                    const uuid = await redisClient.get(`UserGame:${currentUser.id}`);
+                    if (uuid && await redisClient.exists(`Game:${uuid}`) &&
+                        !await redisClient.hGet(`Game:${uuid}`, 'GameOver')) {
+                        throw new Error(`The user is already in Game: ${uuid}`);
+                    }
+                    await setStatusById(currentUser.id, "REGISTERED", cfg);
+                }
+
+                const existingPlayerIndex = lobbyData.players.findIndex(player => player.id === currentUser.id);
+
+                if (existingPlayerIndex === -1) {
+                    if (lobbyData.players.length >= 4) throw new Error("Lobby is full");
+                    let playerType = lobbyId.split('#')[0] === currentUser.username ? "Admin" : "Player";
 
                     lobbyData.players.push({
-                        id: botId++,
-                        mmr: 0,
-                        username: `Bot${botId++}`,
-                        type: "Bot",
-                        lastSuccessfulAttempt: 0
-                    })
-
-                    await setLobbyPlayersData(redisClient, lobbyId, lobbyData.players)
-                    await emitPlayerListToLobby(io, redisClient, lobbyId);
-                    return;
+                        id: currentUser.id,
+                        mmr: currentUser.mmr,
+                        username: currentUser.username,
+                        type: playerType,
+                        ws: socket.id
+                    });
+                } else {
+                    let oldWebsocketId = lobbyData.players[existingPlayerIndex].ws;
+                    io.to(oldWebsocketId).emit("userExist");
+                    await redisClient.del(`Socket:${oldWebsocketId}`);
+                    lobbyData.players[existingPlayerIndex].ws = socket.id;
                 }
-            }
 
-            let currentUser = await extractAndVerifyJWT(data.token, consul, redisClient);
-
-            if (!currentUser.id) {
-                throw new Error("Not able to parse user-id");
-            }
-
-            let currentStatus = await getStatusById(currentUser.id, cfg);
-
-            if (currentStatus === "IN_GAME") {
-                let userData = await getUserJWTCache(redisClient, data.token);
-                throw new Error(`The user is already in Game: ${userData.UUID}`);
-            }
-
-            const existingPlayerIndex = lobbyData.players.findIndex(player => player.id === currentUser.id);
-
-            if (existingPlayerIndex === -1) {
-                let playerType = lobbyId.startsWith(currentUser.username) ? "Admin" : "Player";
-
-                lobbyData.players.push({
-                    id: currentUser.id,
-                    mmr: currentUser.mmr,
-                    username: currentUser.username,
-                    type: playerType,
-                    ws: socket.id
-                });
-            } else {
-                let oldWebsocketId = lobbyData.players[existingPlayerIndex].ws;
-                io.to(oldWebsocketId).emit("userExist");
-                await redisClient.del(`Socket:${oldWebsocketId}`);
-                lobbyData.players[existingPlayerIndex].ws = socket.id;
-            }
-
-            if (lobbyData.players.length === 4) {
+                await socket.join(lobbyId);
+                await setLobbyPlayersData(redisClient, lobbyId, lobbyData.players)
+                await setUserSocket(redisClient, socket.id, lobbyId)
                 await emitPlayerListToLobby(io, redisClient, lobbyId);
-                return;
-            }
-
-            await setLobbyPlayersData(redisClient, lobbyId, lobbyData.players)
-            await setUserSocket(redisClient, socket.id, lobbyId)
-            await emitPlayerListToLobby(io, redisClient, lobbyId);
+            });
         } catch (ex) {
             emitSystemMessage(io, socket, ex.message);
         }
@@ -108,31 +115,34 @@ function join(io, socket, consul, redisClient) {
 function disconnectLobby(io, socket, redisClient) {
     socket.on('disconnect', async () => {
         try {
-            let lobbyId = await getLobbyFromWsSocket(socket.id, redisClient);
-            if (lobbyId == null) return;
-
-            let lobbyData = await fetchLobbyDataAndPlayers(redisClient, lobbyId);
-            let excludeCurrentSocketId = lobbyData.players.filter(player => player.ws !== socket.id);
-
-            let lobbyProperties = checkLobbyProperties(excludeCurrentSocketId);
-
-            if (!lobbyProperties.hasPlayers || !lobbyProperties.hasNoRealPlayersOrAdmin || lobbyProperties.hasNoAdmin) {
-                io.to(lobbyId).emit('lobbyRemoved');
-                await redisClient.del(`Lobby:${lobbyId}`);
-            } else {
-                await setLobbyPlayersData(redisClient, lobbyId, excludeCurrentSocketId)
-                await emitPlayerListToLobby(io, redisClient, lobbyId);
-            }
-
+            const lobbyId = await getLobbyFromWsSocket(socket.id, redisClient);
+            if (!lobbyId) return;
+            const {players} = await fetchLobbyDataAndPlayers(redisClient, lobbyId);
+            const player = players.find(player => player.ws === socket.id);
             await redisClient.del(`Socket:${socket.id}`);
-        } catch (err) {
-            console.error('Error handling disconnect:', err);
+            if (!player) return;
+            setTimeout(() => withGameLock(`lobby:${lobbyId}`, async () => {
+                const lobby = await fetchLobbyDataAndPlayers(redisClient, lobbyId);
+                const current = lobby.players.find(item => item.id === player.id);
+                if (!current || current.ws !== socket.id) return;
+                const remaining = lobby.players.filter(item => item.id !== player.id);
+                const properties = checkLobbyProperties(remaining);
+                if (!properties.hasPlayers || properties.hasNoRealPlayersOrAdmin || properties.hasNoAdmin) {
+                    io.to(lobbyId).emit('lobbyRemoved');
+                    await redisClient.del(`Lobby:${lobbyId}`);
+                } else {
+                    await setLobbyPlayersData(redisClient, lobbyId, remaining);
+                    await emitPlayerListToLobby(io, redisClient, lobbyId);
+                }
+            }).catch(error => console.error('Error handling lobby disconnect:', error)), 10000).unref();
+        } catch (error) {
+            console.error('Error handling lobby disconnect:', error);
         }
     });
 }
 
 function generateGame(io, socket, redisClient, consul) {
-    socket.on('generateGame', async (data) => {
+    socket.on('generateGame', async (data = {}) => {
         try {
             let currentUser = await extractAndVerifyJWT(data.token, consul, redisClient);
             let lobbyId = await getLobbyFromWsSocket(socket.id, redisClient);
@@ -141,69 +151,65 @@ function generateGame(io, socket, redisClient, consul) {
                 throw new Error("Not able to parse lobby-id");
             }
 
-            let lobbyData = await fetchLobbyDataAndPlayers(redisClient, lobbyId);
+            await withGameLock(`lobby:${lobbyId}`, async () => {
+                let lobbyData = await fetchLobbyDataAndPlayers(redisClient, lobbyId);
 
-            let existingPlayerIndex = lobbyData.players.findIndex(player => player.id === currentUser.id);
+                let existingPlayerIndex = lobbyData.players.findIndex(player => player.id === currentUser.id);
 
-            if (existingPlayerIndex === -1) {
-                throw new Error("You are not a player of the lobby");
-            }
+                if (existingPlayerIndex === -1) {
+                    throw new Error("You are not a player of the lobby");
+                }
 
-            let lobbyProperties = checkLobbyProperties(lobbyData.players);
+                if (lobbyData.players[existingPlayerIndex].type !== "Admin") {
+                    throw new Error("Only the lobby admin can start the game");
+                }
+                let lobbyProperties = checkLobbyProperties(lobbyData.players);
 
-            if (!lobbyProperties.isFull) {
-                throw new Error("In the lobby supposed to be only 4 players")
-            }
+                if (!lobbyProperties.isFull) {
+                    throw new Error("In the lobby supposed to be only 4 players")
+                }
 
-            let lobbyUUID = await getLobbyUUID(redisClient, lobbyId);
+                let lobbyUUID = await getLobbyUUID(redisClient, lobbyId);
 
-            if (lobbyUUID !== null) {
-                throw new Error("Game is already created");
-            }
+                if (lobbyUUID !== null) {
+                    throw new Error("Game is already created");
+                }
 
-            const existingUUID = await redisClient.hGet(`Lobby:${lobbyId}`, 'UUID');
+                let uuid = randomUUID();
 
-            if (existingUUID) {
-                io.to(lobbyId).emit("gameUUID", {
-                    uuid: existingUUID
-                });
+                await redisClient.hSet(`Lobby:${lobbyId}`, 'UUID', JSON.stringify({
+                    uuid: uuid,
+                }));
 
-                return;
-            }
+                await redisClient.hSet(`Game:${uuid}`, "LobbyData", JSON.stringify({
+                    players: lobbyProperties.realPlayersOrAdminIds,
+                    bots: lobbyProperties.bots,
+                    readyPlayers: 0,
+                    lobbyId: lobbyId
+                }));
 
-            let uuid = uuidv4();
+                await redisClient.hSet(`Game:${uuid}`, "GameArea", JSON.stringify(generateArea()));
+                await redisClient.hSet(`Game:${uuid}`, `LastActionId`, 0);
+                await redisClient.hSet(`Game:${uuid}`, `Action:0`, JSON.stringify({
+                    "openBubbles": [],
+                    "requestedBubbles": {},
+                    "sender": {},
+                    "serverTime": new Date().toISOString()
+                }));
 
-            await redisClient.hSet(`Lobby:${lobbyId}`, 'UUID', JSON.stringify({
-                uuid: uuid,
-            }));
+                await redisClient.hSet(`Game:${uuid}`, `GamePaused`, 'true');
+                await redisClient.hSet(`Game:${uuid}`, 'LastMoveAt', String(Date.now()));
 
-            await redisClient.hSet(`Game:${uuid}`, "LobbyData", JSON.stringify({
-                players: lobbyProperties.realPlayersOrAdminIds,
-                bots: lobbyProperties.bots,
-                readyPlayers: 0,
-                lobbyId: lobbyId
-            }));
+                await redisClient.expire(`Game:${uuid}`, 6 * 60 * 60);
 
-            await redisClient.hSet(`Game:${uuid}`, "GameArea", JSON.stringify(generateArea()));
-            await redisClient.hSet(`Game:${uuid}`, `LastActionId`, 0);
-            await redisClient.hSet(`Game:${uuid}`, `Action:0`, JSON.stringify({
-                "openBubbles": [],
-                "requestedBubbles": {},
-                "sender": {},
-                "serverTime": new Date().toISOString()
-            }));
+                const cfg = await getPostgresConfig(consul);
 
-            await redisClient.hSet(`Game:${uuid}`, `GamePaused`, 'true');
-
-            io.to(lobbyId).emit("gameUUID", {
-                uuid: uuid
+                for (const it of lobbyProperties.realPlayersOrAdminIds) {
+                    await redisClient.set(`UserGame:${it}`, uuid, {EX: 6 * 60 * 60});
+                    await setStatusById(it, "IN_GAME", cfg);
+                }
+                io.to(lobbyId).emit("gameUUID", {uuid});
             });
-
-            const cfg = await getPostgresConfig(consul);
-
-            for (const it of lobbyProperties.realPlayersOrAdminIds) {
-                await setStatusById(it, "IN_GAME", cfg)
-            }
         } catch (ex) {
             let data = JSON.stringify({
                 message: ex.message
