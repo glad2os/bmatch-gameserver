@@ -1,7 +1,6 @@
 const {withGameLock} = require("../utils/gameLock");
-const {verify} = require("jsonwebtoken");
-const {JWTToken, getPostgresConfig} = require("../config/config");
-const {fetchUserById, setStatusById, getStatusById} = require("../utils/getPostgresqlUserData");
+const {getPostgresConfig} = require("../config/config");
+const {setStatusById, getStatusById} = require("../utils/getPostgresqlUserData");
 const {v4: uuidv4} = require('uuid');
 const {generateArea} = require('../gameLogic/areaGenerator')
 const {
@@ -158,6 +157,9 @@ function generateGame(io, socket, redisClient, consul) {
                 throw new Error("You are not a player of the lobby");
             }
 
+            if (lobbyData.players[existingPlayerIndex].type !== "Admin") {
+                throw new Error("Only the lobby admin can start the game");
+            }
             let lobbyProperties = checkLobbyProperties(lobbyData.players);
 
             if (!lobbyProperties.isFull) {
@@ -168,16 +170,6 @@ function generateGame(io, socket, redisClient, consul) {
 
             if (lobbyUUID !== null) {
                 throw new Error("Game is already created");
-            }
-
-            const existingUUID = await redisClient.hGet(`Lobby:${lobbyId}`, 'UUID');
-
-            if (existingUUID) {
-                io.to(lobbyId).emit("gameUUID", {
-                    uuid: existingUUID
-                });
-
-                return;
             }
 
             let uuid = uuidv4();

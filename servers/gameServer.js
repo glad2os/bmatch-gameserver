@@ -5,7 +5,7 @@ const {joinServer, disconnectServer, openedBubble, chatMessage, ping, initExpira
     setupRabbitMQ, listenForExpiredMessages
 } = require("../sockets/gamews");
 
-const useTLS = process.env.USE_TLS;
+const useTLS = process.env.USE_TLS === 'true';
 
 async function startGameServer(app, options, consul, redisClient, rabbitMQChannel) {
 
