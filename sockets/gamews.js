@@ -137,8 +137,8 @@ function joinServer(io, socket, consul, redisClient, rabbitMQChannel) {
             io.to(data.gameUUID).emit('playerList', currentGamePlayers);
 
             if (!data.token) {
-                const actionPointer = getActionPointer(redisClient, data.gameUUID)
-                const action = await getAction(redisClient, data.gameUUID, actionPointer - 2);
+                const actionPointer = await getActionPointer(redisClient, data.gameUUID)
+                const action = await getAction(redisClient, data.gameUUID, actionPointer);
                 console.log(action);
                 if (action) io.to(socket.id).emit("gameAction", action);
                 return;
@@ -148,8 +148,8 @@ function joinServer(io, socket, consul, redisClient, rabbitMQChannel) {
 
             if (!currentUserId) {
                 // Guest handler
-                const actionPointer = getActionPointer(redisClient, data.gameUUID)
-                const action = await getAction(redisClient, data.gameUUID, actionPointer - 2);
+                const actionPointer = await getActionPointer(redisClient, data.gameUUID)
+                const action = await getAction(redisClient, data.gameUUID, actionPointer);
                 console.log(action);
                 if (action) io.to(socket.id).emit("gameAction", action);
                 return;
