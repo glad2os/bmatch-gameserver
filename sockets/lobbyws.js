@@ -17,28 +17,17 @@ const {
 
 
 function join(io, socket, consul, redisClient) {
-    socket.on('join', async (data) => {
+    socket.on('join', async (data = {}) => {
         let lobbyId = data.lobbyID;
 
         if (lobbyId === undefined) {
             return;
         }
 
-        socket.join(lobbyId);
-
         try {
+            await withGameLock(`lobby:${lobbyId}`, async () => {
             let cfg = await getPostgresConfig(consul);
             let lobbyData = await fetchLobbyDataAndPlayers(redisClient, lobbyId);
-
-            let lobbyUUID = await getLobbyUUID(redisClient, lobbyId);
-
-            if (lobbyUUID !== null) {
-                io.to(lobbyId).emit("gameUUID", {
-                    uuid: JSON.parse(lobbyUUID).uuid
-                });
-            }
-
-            await setUserSocket(redisClient, socket.id, lobbyId)
 
             if (data.type === "Bot") {
                 const admin = await extractAndVerifyJWT(data.token, consul, redisClient);
@@ -70,6 +59,11 @@ function join(io, socket, consul, redisClient) {
                 throw new Error("Not able to parse user-id");
             }
 
+            const existingUUID = await getLobbyUUID(redisClient, lobbyId);
+            if (existingUUID && lobbyData.players.some(player => player.id === currentUser.id)) {
+                io.to(socket.id).emit('gameUUID', JSON.parse(existingUUID));
+                return;
+            }
             let currentStatus = await getStatusById(currentUser.id, cfg);
 
             if (currentStatus === "IN_GAME") {
@@ -101,9 +95,11 @@ function join(io, socket, consul, redisClient) {
                 lobbyData.players[existingPlayerIndex].ws = socket.id;
             }
 
+            await socket.join(lobbyId);
             await setLobbyPlayersData(redisClient, lobbyId, lobbyData.players)
             await setUserSocket(redisClient, socket.id, lobbyId)
             await emitPlayerListToLobby(io, redisClient, lobbyId);
+            });
         } catch (ex) {
             emitSystemMessage(io, socket, ex.message);
         }
@@ -140,7 +136,7 @@ function disconnectLobby(io, socket, redisClient) {
 }
 
 function generateGame(io, socket, redisClient, consul) {
-    socket.on('generateGame', async (data) => {
+    socket.on('generateGame', async (data = {}) => {
         try {
             let currentUser = await extractAndVerifyJWT(data.token, consul, redisClient);
             let lobbyId = await getLobbyFromWsSocket(socket.id, redisClient);
@@ -149,6 +145,7 @@ function generateGame(io, socket, redisClient, consul) {
                 throw new Error("Not able to parse lobby-id");
             }
 
+            await withGameLock(`lobby:${lobbyId}`, async () => {
             let lobbyData = await fetchLobbyDataAndPlayers(redisClient, lobbyId);
 
             let existingPlayerIndex = lobbyData.players.findIndex(player => player.id === currentUser.id);
@@ -205,6 +202,7 @@ function generateGame(io, socket, redisClient, consul) {
                 await setStatusById(it, "IN_GAME", cfg);
             }
             io.to(lobbyId).emit("gameUUID", {uuid});
+            });
         } catch (ex) {
             let data = JSON.stringify({
                 message: ex.message
