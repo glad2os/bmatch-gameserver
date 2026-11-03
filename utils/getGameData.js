@@ -4,23 +4,8 @@ const consul = require("consul");
 const {setNextPlayerId} = require("../gameLogic/queue");
 const util = require("util");
 
-const getUserFromRedisByUserId = async (redisClient, consul, userId) => {
-
-    const userProfileKey = `user_profile:${userId}`;
-
-    let userProfile = await redisClient.get(userProfileKey);
-
-    if (userProfile) {
-        userProfile = JSON.parse(userProfile);
-    } else {
-        const cfg = await getPostgresConfig(consul);
-        userProfile = await fetchUserById(userId, cfg);
-
-        await redisClient.hSet(userProfileKey, JSON.stringify(userProfile), 'EX', 3600);
-    }
-
-    return userProfile;
-};
+const {getCachedUserProfile} = require("./userProfileCache");
+const getUserFromRedisByUserId = getCachedUserProfile;
 
 async function getGamePlayers(redisClient, consul, gameUUID) {
     let gameData = await getLobbyData(redisClient, gameUUID)

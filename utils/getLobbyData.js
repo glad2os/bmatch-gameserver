@@ -1,25 +1,12 @@
 const {getPostgresConfig, JWTToken} = require("../config/config");
-const {fetchUserById} = require("./getPostgresqlUserData");
+const {getCachedUserProfile} = require("./userProfileCache");
 const {verify} = require("jsonwebtoken");
 
 async function extractAndVerifyJWT(jwt, consul, redisClient) {
     const verifyPlayer = verify(jwt, JWTToken);
     const userId = verifyPlayer.sub;
 
-    const userProfileKey = `user_profile:${userId}`;
-
-    let userProfile = await redisClient.get(userProfileKey);
-
-    if (userProfile) {
-        userProfile = JSON.parse(userProfile);
-    } else {
-        const cfg = await getPostgresConfig(consul);
-        userProfile = await fetchUserById(userId, cfg);
-
-        await redisClient.set(userProfileKey, JSON.stringify(userProfile), 'EX', 3600);
-    }
-
-    return userProfile;
+    return getCachedUserProfile(redisClient, consul, userId);
 }
 
 function checkLobbyProperties(players) {

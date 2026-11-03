@@ -4,7 +4,7 @@ const fetchUserById = async (userId, config) => {
     const client = new Client(config);
     try {
         await client.connect();
-        const res = await client.query('SELECT * FROM users WHERE id = $1', [userId]);
+        const res = await client.query('SELECT id, username, mmr FROM users WHERE id = $1', [userId]);
         return res.rows[0];
     } catch (err) {
         throw err;
