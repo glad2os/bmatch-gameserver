@@ -4,7 +4,8 @@ const cors = require("cors");
 const Consul = require('consul');
 const fs = require('fs');
 const path = require('path');
-const {consulHost, consulPort, getRedisConfig, getRabbitMQConfig} = require("./config/config");
+const {consulHost, consulPort, getRedisConfig, getRabbitMQConfig, getPostgresConfig} = require("./config/config");
+const {ensureReplayTable} = require("./utils/replayStore");
 const {startLobbyServer} = require('./servers/lobbyServer');
 const {startGameServer} = require('./servers/gameServer');
 const {connect} = require("amqplib");
@@ -38,6 +39,8 @@ const initializeServices = async () => {
 
     redisClient.on('error', err => console.log('Redis Client Error', err));
     await redisClient.connect();
+
+    await ensureReplayTable(await getPostgresConfig(consul));
 
     const rabbitMQConnection  = await connect(`amqp://${rabbitMQConfig.user}:${rabbitMQConfig.pass}@${rabbitMQConfig.host}:${rabbitMQConfig.port}`);
     const rabbitMQChannel  = await rabbitMQConnection.createChannel();

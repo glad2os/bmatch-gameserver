@@ -4,7 +4,7 @@ const {sign} = require('jsonwebtoken');
 const {Pool} = require('pg');
 const {JWTToken, idleGameTimeoutMs} = require('../config/config');
 const {joinLobby, generateGame} = require('../sockets/lobbyws');
-const {openedBubble, userPause, joinServer, disconnectServer, listenForExpiredMessages, chatMessage} = require('../sockets/gamews');
+const {openedBubble, userPause, joinServer, disconnectServer, listenForExpiredMessages, chatMessage, leaveGame} = require('../sockets/gamews');
 const {withGameLock} = require('../utils/gameLock');
 const {setTimer, getRemainingTime} = require('../utils/getGameData');
 const {endGame} = require('../utils/endGameHandler');
@@ -39,7 +39,12 @@ function environment() {
         exists: async key => Number(values.has(key)),
         expire: async (key, seconds) => { ttls.set(key, seconds); return true; },
         ttl: async key => ttls.get(key) ?? -1,
-        del: async key => values.delete(key)
+        del: async keys => [keys].flat().forEach(key => values.delete(key)),
+        rPush: async (key, value) => {
+            const list = values.get(key) || [];
+            list.push(value); values.set(key, list); return list.length;
+        },
+        lRange: async key => [...(values.get(key) || [])]
     };
     const events = [];
     const io = {to: target => ({emit: (name, value) => events.push({target, name, value})})};
@@ -65,7 +70,9 @@ function environment() {
 }
 
 // No external database is required; cached safe profiles exercise real JWT/auth paths.
-Pool.prototype.query = async () => ({rows: [{status: 'REGISTERED'}]});
+const queries = [];
+Pool.prototype.query = async (text, params) => { queries.push({text, params}); return {rows: [{status: 'REGISTERED'}]}; };
+const replayInserts = () => queries.filter(query => query.text.includes('INSERT INTO game_replays'));
 
 test('four simultaneous human joins persist; fifth and unauthorized bot are rejected', async () => {
     const e = environment();
@@ -104,6 +111,8 @@ test('simultaneous repeated clicks cannot create a matched pair', async () => {
     await socket.handlers.sendOpenedBubble({token, gameUUID: 'game', bubbleId: 1});
     const matched = JSON.parse(await e.redis.hGet('Game:game', 'Action:2'));
     assert.equal(matched.openBubbles.length, 2);
+    // The owner of a found pair is stored so clients can colour it after a reconnect.
+    assert.deepEqual(matched.openBubbles.map(bubble => bubble.openedBy), [{type: 'Player', id: 1}, {type: 'Player', id: 1}]);
     await socket.handlers.sendOpenedBubble({token, gameUUID: 'game', bubbleId: 0});
     assert.equal(await e.redis.hGet('Game:game', 'LastActionId'), '2');
 });
@@ -146,12 +155,15 @@ test('stale timers are ignored; timeouts skip turns until the game has been idle
     assert.equal(await e.redis.hGet('Game:game', 'LastActionId'), '6');
     // No human move for longer than the limit: the next timeout ends the game.
     await e.redis.hSet('Game:game', 'LastMoveAt', String(Date.now() - idleGameTimeoutMs - 1000));
+    const inserts = replayInserts().length;
     await fire();
     await endGame(e.io, e.redis, e.channel, e.consul, 'game');
     assert.equal(acks, 8);
-    assert.equal(await e.redis.hGet('Game:game', 'GameOver'), '1');
-    assert.equal(e.events.filter(event => event.name === 'gameOver').length, 1);
-    assert.equal(e.ttls.get('Game:game'), 600);
+    // An abandoned game is not recorded and is removed from Redis.
+    assert.equal(await e.redis.exists('Game:game'), 0);
+    assert.equal(await e.redis.exists('Game:game:Events'), 0);
+    assert.equal(replayInserts().length, inserts);
+    assert.deepEqual(e.events.filter(event => event.name === 'gameOver').map(event => event.value.reason), ['abandoned']);
 });
 
 test('chat is delivered while the game lock is held', async () => {
@@ -208,6 +220,10 @@ test('bot turn runs in the background and does not hold the game lock between cl
     assert.equal(await e.redis.exists('Game:game:BotRunning'), 0);
     assert.equal(published.length, 2);
     assert.ok(e.events.some(event => event.name === 'closeBubbles'));
+    const log = (await e.redis.lRange('Game:game:Events')).map(event => JSON.parse(event));
+    assert.deepEqual(log.map(event => event.type), ['timeout', 'turn', 'open', 'open', 'miss', 'turn']);
+    assert.deepEqual(log[2].player, {type: 'Bot', id: 'bot-0'});
+    assert.deepEqual(log[5].player, {type: 'Player', id: 1});
 });
 
 test('guests receive action zero and disconnect removes socket tracking', async () => {
@@ -230,4 +246,142 @@ test('authentication has the same UserId before and after cache creation', async
     assert.deepEqual(first, cached);
     assert.equal(first.UserId, 1);
     assert.equal(JSON.parse(await e.redis.hGet('Game:game', 'LobbyData')).readyPlayers, 1);
+});
+
+test('a player who is still in a running game is offered that game instead of joining a lobby', async () => {
+    const e = environment(); await e.game();
+    const token = await e.user(1);
+    await e.redis.set('UserGame:1', 'game');
+    const query = Pool.prototype.query;
+    Pool.prototype.query = async () => ({rows: [{status: 'IN_GAME'}]});
+    try {
+        const socket = e.socket('ws1');
+        joinLobby(e.io, socket, e.consul, e.redis);
+        await socket.handlers.join({lobbyID: 'player2#1000-3000', token});
+        assert.deepEqual(e.events.at(-1), {target: 'ws1', name: 'activeGame', value: {uuid: 'game'}});
+        assert.equal(await e.redis.hGet('Lobby:player2#1000-3000', 'Players'), null);
+    } finally {
+        Pool.prototype.query = query;
+    }
+});
+
+test('leaving on your turn closes the first pick and a bot takes your seat and turn', async () => {
+    const e = environment(); await e.game();
+    const token = await e.user(1); await e.user(2);
+    const socket = e.socket('ws1');
+    openedBubble(e.io, socket, e.consul, e.redis, e.channel);
+    leaveGame(e.io, socket, e.consul, e.redis, e.channel);
+    await socket.handlers.sendOpenedBubble({token, gameUUID: 'game', bubbleId: 4});
+    await socket.handlers.leaveGame({token, gameUUID: 'game'});
+
+    const lobby = JSON.parse(await e.redis.hGet('Game:game', 'LobbyData'));
+    assert.deepEqual(lobby.leftPlayers, [1]);
+    assert.ok(e.events.some(event => event.name === 'currentPlayer' && event.value.id === 'bot-for-1'));
+    assert.ok(e.events.some(event => event.name === 'closeBubbles' && event.value.firstBubbleId === 4));
+    assert.ok(e.events.some(event => event.target === 'ws1' && event.name === 'leftGame'));
+    const action = JSON.parse(await e.redis.hGet('Game:game', `Action:${await e.redis.hGet('Game:game', 'LastActionId')}`));
+    assert.deepEqual(action.requestedBubbles, {});
+    // The seat (and its colour on clients) stays; the substitute says whom it replaces.
+    const players = e.events.filter(event => event.name === 'playerList').at(-1).value;
+    assert.deepEqual(players.map(player => [player.id, player.type]), [['bot-for-1', 'Bot'], [2, 'Player']]);
+    assert.deepEqual(players[0].replaces, {type: 'Player', id: 1});
+    const log = (await e.redis.lRange('Game:game:Events', 0, -1)).map(event => JSON.parse(event));
+    const leaveAt = log.findIndex(event => event.type === 'leave');
+    assert.deepEqual(log.slice(leaveAt, leaveAt + 3).map(event => [event.type, event.player.id]),
+        [['leave', 1], ['replace', 1], ['turn', 'bot-for-1']]);
+    assert.equal(await e.redis.hGet('Game:game', 'GameOver'), null);
+});
+
+test('the game ends when every human player has left', async () => {
+    const e = environment(); await e.game();
+    const token1 = await e.user(1); const token2 = await e.user(2);
+    const first = e.socket('ws1'); const second = e.socket('ws2');
+    leaveGame(e.io, first, e.consul, e.redis, e.channel);
+    leaveGame(e.io, second, e.consul, e.redis, e.channel);
+    await second.handlers.leaveGame({token: token2, gameUUID: 'game'});
+    assert.equal(await e.redis.hGet('Game:game', 'GameOver'), null);
+    // A player who left cannot leave (or act) again.
+    await second.handlers.leaveGame({token: token2, gameUUID: 'game'});
+    assert.equal(e.events.filter(event => event.name === 'leftGame').length, 1);
+    const inserts = replayInserts().length;
+    await first.handlers.leaveGame({token: token1, gameUUID: 'game'});
+    assert.equal(await e.redis.exists('Game:game'), 0);
+    assert.equal(replayInserts().length, inserts);
+    assert.equal(e.events.filter(event => event.name === 'gameOver').length, 1);
+});
+
+test('a completed game is saved as a replay with every move and kept briefly in Redis', async () => {
+    const e = environment(); await e.game();
+    const token = await e.user(1); await e.user(2);
+    // 49 pairs are already found (bubbles 0..97); player 1 opens the last pair.
+    const found = Array.from({length: 98}, (_, i) => ({bubbleId: i, bubbleImg: Math.floor(i / 2) + 1}));
+    await e.redis.hSet('Game:game', 'Action:0', JSON.stringify({openBubbles: found, requestedBubbles: {}}));
+    const socket = e.socket('ws1');
+    openedBubble(e.io, socket, e.consul, e.redis, e.channel);
+    chatMessage(e.io, socket, e.consul, e.redis);
+    await socket.handlers.chatMessage({gameUUID: 'game', token, message: 'last one'});
+    await socket.handlers.sendOpenedBubble({token, gameUUID: 'game', bubbleId: 98});
+    await socket.handlers.sendOpenedBubble({token, gameUUID: 'game', bubbleId: 99});
+
+    // The results screen gets pairs per seat and the winners with the game over event.
+    const [over] = e.events.filter(event => event.name === 'gameOver').map(event => event.value);
+    assert.equal(over.reason, 'completed');
+    assert.equal(over.debug, false);
+    assert.deepEqual(over.pairs.find(entry => entry.player.id === 1), {player: {type: 'Player', id: 1}, pairs: 1});
+    assert.deepEqual(over.winners, [{type: 'Player', id: 1}]);
+    const [insert] = replayInserts().slice(-1);
+    assert.ok(insert, 'replay saved');
+    const [uuid, lobbyId, , , players, board, events, summary] = insert.params;
+    assert.equal(uuid, 'game');
+    assert.equal(lobbyId, undefined);
+    assert.deepEqual(JSON.parse(players).map(player => [player.type, player.id, player.username]), [['Player', 1, 'player1'], ['Player', 2, 'player2']]);
+    assert.equal(JSON.parse(board).length, 100);
+    const log = JSON.parse(events);
+    assert.deepEqual(log.map(event => event.type), ['chat', 'open', 'open', 'match', 'end']);
+    assert.deepEqual(log[3], {...log[3], player: {type: 'Player', id: 1}, bubbles: [98, 99]});
+    assert.ok(log.every(event => typeof event.t === 'number'));
+    assert.deepEqual(JSON.parse(summary).winners, [{type: 'Player', id: 1}]);
+    assert.equal(e.ttls.get('Game:game'), 600);
+    assert.equal(e.ttls.get('Game:game:Events'), 600);
+});
+
+test('"debug end" plays every turn automatically to a real end and saves the replay as debug', async () => {
+    const e = environment(); await e.game();
+    const token = await e.user(1); await e.user(2); const spectatorToken = await e.user(3);
+    // 48 pairs found; bubbles 96..99 (two pairs) are still closed.
+    const found = Array.from({length: 96}, (_, i) => ({bubbleId: i, bubbleImg: Math.floor(i / 2) + 1}));
+    await e.redis.hSet('Game:game', 'Action:0', JSON.stringify({openBubbles: found, requestedBubbles: {}}));
+    await e.redis.hSet('Game:game', 'PlayersSockets', JSON.stringify(['ws1']));
+    const socket = e.socket('ws1'); const spectator = e.socket('ws3');
+    chatMessage(e.io, socket, e.consul, e.redis, e.channel);
+    chatMessage(e.io, spectator, e.consul, e.redis, e.channel);
+    openedBubble(e.io, socket, e.consul, e.redis, e.channel);
+
+    await spectator.handlers.chatMessage({gameUUID: 'game', token: spectatorToken, message: 'debug end'});
+    assert.equal(await e.redis.hGet('Game:game', 'Debug'), null);
+
+    const inserts = replayInserts().length;
+    await socket.handlers.chatMessage({gameUUID: 'game', token, message: '  Debug End '});
+    assert.equal(await e.redis.hGet('Game:game', 'Debug'), '1');
+    assert.ok(e.events.some(event => event.name === 'debugMode'));
+    assert.ok(!e.events.some(event => event.name === 'receiveMessage' && event.value.message.trim().toLowerCase() === 'debug end'));
+    // Manual clicks are ignored while the game plays itself.
+    const pointer = await e.redis.hGet('Game:game', 'LastActionId');
+    await socket.handlers.sendOpenedBubble({token, gameUUID: 'game', bubbleId: 96});
+    assert.equal(await e.redis.hGet('Game:game', 'LastActionId'), pointer);
+
+    const deadline = Date.now() + 20000;
+    while (replayInserts().length === inserts && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 50));
+    const [insert] = replayInserts().slice(-1);
+    assert.ok(replayInserts().length > inserts, 'debug game finished and was saved');
+    assert.equal(insert.params[8], true);
+    const log = JSON.parse(insert.params[6]);
+    assert.equal(log[0].type, 'debug');
+    assert.equal(log.filter(event => event.type === 'match').length, 2);
+    // Human turns were played by the bot logic and recorded as the human.
+    assert.ok(log.some(event => event.type === 'open' && event.player.type === 'Player'));
+    assert.equal(log.at(-1).type, 'end');
+    assert.equal(JSON.parse(insert.params[7]).debug, true);
+    // No turn timer is published in debug mode.
+    assert.ok(!e.events.some(event => event.name === 'timeRequested' && event.value === 30));
 });

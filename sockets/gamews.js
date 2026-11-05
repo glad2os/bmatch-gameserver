@@ -1,17 +1,21 @@
 const {
     getLobbyData, getGamePlayers, getCurrentGamePlayer, setCurrentGamePlayer,
-    getReadyPlayers, getActionPointer, getGameArea,
+    getReadyPlayers, getActionPointer, getGameArea, getUserFromRedisByUserId,
     setAction, setActionPointer, getAction, setPaused, getPaused, setNextPlayer,
     emitOpenBubbles, emitCloseBubbles, getGameWebSocketsFromRedis,
     getGameUUIDByGameWS, setTimer, getUserPaused, setUserPaused,
-    getRemainingTime, cancelTimer, linkUserWithWebSocket, addGameWebSocketsGuestsToRedis
+    getRemainingTime, cancelTimer, linkUserWithWebSocket, addGameWebSocketsGuestsToRedis, isActivePlayer,
+    isDebugGame
 } = require('../utils/getGameData');
+const {setStatusById} = require('../utils/getPostgresqlUserData');
+const {getPostgresConfig} = require('../config/config');
 const {emitSystemMessage, extractAndVerifyJWT} = require('../utils/getLobbyData');
 const {performBotActions} = require('../gameLogic/pseudoRandomBotLogic');
 const {handleUserAuthentication} = require('../utils/userAuth');
 const {endGame} = require('../utils/endGameHandler');
 const {validateMove} = require('../gameLogic/validateMove');
 const {withGameLock} = require('../utils/gameLock');
+const {recordEvent, playerRef} = require('../utils/gameEvents');
 const {idleGameTimeoutMs} = require('../config/config');
 
 async function setupRabbitMQ(channel) {
@@ -29,7 +33,7 @@ async function isActive(redisClient, uuid) {
 async function finishIfComplete(io, redisClient, channel, consul, uuid) {
     const action = await getAction(redisClient, uuid, await getActionPointer(redisClient, uuid));
     if (action && action.openBubbles.length === 100) {
-        await endGame(io, redisClient, channel, consul, uuid);
+        await endGame(io, redisClient, channel, consul, uuid, 'completed');
         return true;
     }
     return !await isActive(redisClient, uuid);
@@ -42,13 +46,15 @@ const botRunningKey = uuid => `Game:${uuid}:BotRunning`;
 async function continueTurn(io, redisClient, channel, consul, uuid) {
     if (await finishIfComplete(io, redisClient, channel, consul, uuid)) return;
     const player = await getCurrentGamePlayer(redisClient, uuid);
-    if (player?.type === 'Bot') {
+    // Bots always play automatically; in debug mode human players do too.
+    if (player && (player.type === 'Bot' || await isDebugGame(redisClient, uuid))) {
         const key = botRunningKey(uuid);
         if (!await redisClient.set(key, '1', {NX: true, EX: 120})) {
             const ttl = await redisClient.ttl(key);
             setTimeout(() => withGameLock(uuid, async () => {
-                if (await isActive(redisClient, uuid) &&
-                    (await getCurrentGamePlayer(redisClient, uuid))?.type === 'Bot') {
+                const current = await getCurrentGamePlayer(redisClient, uuid);
+                if (await isActive(redisClient, uuid) && current &&
+                    (current.type === 'Bot' || await isDebugGame(redisClient, uuid))) {
                     await continueTurn(io, redisClient, channel, consul, uuid);
                 }
             }).catch(console.error), Math.max(1, ttl + 1) * 1000).unref();
@@ -92,6 +98,7 @@ async function listenForExpiredMessages(io, redisClient, channel, consul) {
             const {gameUUID: uuid, turnId} = JSON.parse(message.content.toString());
             await withGameLock(uuid, async () => {
                 if (!await isActive(redisClient, uuid)) return;
+                if (await isDebugGame(redisClient, uuid)) return;
                 if (Number(await redisClient.hGet(`Game:${uuid}`, 'TurnId')) !== turnId) return;
                 if ((await getUserPaused(redisClient, uuid)).paused) return;
                 const current = await getCurrentGamePlayer(redisClient, uuid);
@@ -103,11 +110,12 @@ async function listenForExpiredMessages(io, redisClient, channel, consul) {
                 if (!lastMoveAt) {
                     await redisClient.hSet(`Game:${uuid}`, 'LastMoveAt', String(Date.now()));
                 } else if (Date.now() - lastMoveAt >= idleGameTimeoutMs) {
-                    await endGame(io, redisClient, channel, consul, uuid);
+                    await endGame(io, redisClient, channel, consul, uuid, 'abandoned');
                     return;
                 }
                 await setPaused(redisClient, uuid, 'true');
                 try {
+                    await recordEvent(redisClient, uuid, {type: 'timeout', player: playerRef(current)});
                     await cancelTimer(redisClient, channel, uuid);
                     action.requestedBubbles = {};
                     await setAction(redisClient, uuid, pointer + 1, action);
@@ -155,8 +163,11 @@ function joinServer(io, socket, consul, redisClient, channel) {
                     if (!current) {
                         current = players[0];
                         await setCurrentGamePlayer(redisClient, uuid, current);
+                        await recordEvent(redisClient, uuid, {type: 'start', players: players.map(playerRef)});
+                        await recordEvent(redisClient, uuid, {type: 'turn', player: playerRef(current)});
                         await continueTurn(io, redisClient, channel, consul, uuid);
-                    } else if (current.type === 'Bot' && !(await getUserPaused(redisClient, uuid)).paused) {
+                    } else if ((current.type === 'Bot' || await isDebugGame(redisClient, uuid)) &&
+                        !(await getUserPaused(redisClient, uuid)).paused) {
                         await continueTurn(io, redisClient, channel, consul, uuid);
                         current = await getCurrentGamePlayer(redisClient, uuid);
                     }
@@ -164,6 +175,7 @@ function joinServer(io, socket, consul, redisClient, channel) {
                 if (current) io.to(uuid).emit('currentPlayer', current);
                 io.to(socket.id).emit('timeRequested', await getRemainingTime(redisClient, uuid));
                 io.to(socket.id).emit('isPaused', await getUserPaused(redisClient, uuid));
+                if (await isDebugGame(redisClient, uuid)) io.to(socket.id).emit('debugMode', true);
             });
         } catch (error) {
             emitSystemMessage(io, socket, error.message);
@@ -197,7 +209,7 @@ function openedBubble(io, socket, consul, redisClient, channel) {
         try {
             await withGameLock(uuid, async () => {
                 if (!await isActive(redisClient, uuid) || await getPaused(redisClient, uuid) ||
-                    (await getUserPaused(redisClient, uuid)).paused) return;
+                    (await getUserPaused(redisClient, uuid)).paused || await isDebugGame(redisClient, uuid)) return;
                 const auth = await handleUserAuthentication(io, data, socket, redisClient, consul);
                 if (!auth) return;
                 const current = await getCurrentGamePlayer(redisClient, uuid);
@@ -208,7 +220,8 @@ function openedBubble(io, socket, consul, redisClient, channel) {
                 if (!validateMove(data.bubbleId, lastAction, points)) return;
                 const bubbleId = Number(data.bubbleId);
                 const area = await getGameArea(redisClient, uuid);
-                const bubble = {bubbleId, bubbleImg: area[bubbleId]};
+                // openedBy is kept with matched pairs so clients can colour them after a reconnect.
+                const bubble = {bubbleId, bubbleImg: area[bubbleId], openedBy: {type: current.type, id: current.id}};
                 const action = {
                     openBubbles: [...lastAction.openBubbles], requestedBubbles: bubble,
                     sender: current, serverTime: new Date().toISOString()
@@ -227,6 +240,12 @@ function openedBubble(io, socket, consul, redisClient, channel) {
                 await setCurrentGamePlayer(redisClient, uuid, current);
                 await setAction(redisClient, uuid, pointer + 1, action);
                 await setActionPointer(redisClient, uuid, pointer + 1);
+                const player = playerRef(current);
+                await recordEvent(redisClient, uuid, {type: 'open', player, bubbleId, bubbleImg: bubble.bubbleImg});
+                if (points === 1) {
+                    const bubbles = [Number(lastAction.requestedBubbles.bubbleId), bubbleId];
+                    await recordEvent(redisClient, uuid, {type: miss ? 'miss' : 'match', player, bubbles});
+                }
                 await emitOpenBubbles(io, uuid, bubbleId, bubble.bubbleImg);
                 if (miss) {
                     await setPaused(redisClient, uuid, 'true');
@@ -253,7 +272,41 @@ function openedBubble(io, socket, consul, redisClient, channel) {
     });
 }
 
-function chatMessage(io, socket, consul, redisClient) {
+// "debug end" in the chat: no more turn timers and every turn (humans included) is played by the bot
+// logic as fast as possible, so the game reaches a real end quickly; used to collect test replays.
+const DEBUG_COMMAND = /^\s*debug\s+end\s*$/i;
+
+async function enableDebugMode(io, redisClient, channel, consul, uuid, user) {
+    await withGameLock(uuid, async () => {
+        if (!await isActive(redisClient, uuid)) return;
+        if (!await redisClient.hSetNX(`Game:${uuid}`, 'Debug', '1')) return;
+        await recordEvent(redisClient, uuid, {type: 'debug', player: {type: 'Player', id: user.id}});
+        await cancelTimer(redisClient, channel, uuid);
+        await closeUnfinishedPick(io, redisClient, uuid);
+        io.to(uuid).emit('debugMode', true);
+        io.to(uuid).emit('timeRequested', 0);
+        io.to(uuid).emit('receiveMessage', {
+            message: `${user.username} turned on debug mode: every turn is played automatically until the end`,
+            username: 'System'
+        });
+        await continueTurn(io, redisClient, channel, consul, uuid);
+    });
+}
+
+// Closes a first pick that has no second one (the turn ends early: leaving, debug mode).
+async function closeUnfinishedPick(io, redisClient, uuid) {
+    const pointer = await getActionPointer(redisClient, uuid);
+    const action = await getAction(redisClient, uuid, pointer);
+    if (action?.requestedBubbles?.bubbleId == null) return;
+    const bubbleId = Number(action.requestedBubbles.bubbleId);
+    await emitCloseBubbles(io, uuid, bubbleId, bubbleId);
+    action.requestedBubbles = {};
+    await setAction(redisClient, uuid, pointer + 1, action);
+    await setActionPointer(redisClient, uuid, pointer + 1);
+    io.to(uuid).emit('gameAction', action);
+}
+
+function chatMessage(io, socket, consul, redisClient, channel) {
     socket.on('chatMessage', async (data = {}) => {
         if (!data.gameUUID || typeof data.message !== 'string' || data.message.length < 1 || data.message.length > 64) return;
         try {
@@ -261,10 +314,15 @@ function chatMessage(io, socket, consul, redisClient) {
             if (!await isActive(redisClient, data.gameUUID)) return;
             const user = await extractAndVerifyJWT(data.token, consul, redisClient);
             const lobby = await getLobbyData(redisClient, data.gameUUID);
-            if (!lobby.players.includes(user.id)) {
+            if (!isActivePlayer(lobby, user.id)) {
                 io.to(socket.id).emit('receiveMessage', {message: 'nobody hears you ;(', username: 'System'});
                 return;
             }
+            if (DEBUG_COMMAND.test(data.message)) {
+                await enableDebugMode(io, redisClient, channel, consul, data.gameUUID, user);
+                return;
+            }
+            await recordEvent(redisClient, data.gameUUID, {type: 'chat', player: {type: 'Player', id: user.id}, message: data.message});
             for (const id of await getGameWebSocketsFromRedis(redisClient, data.gameUUID)) {
                 io.to(id).emit('receiveMessage', {message: data.message, username: user.username});
             }
@@ -284,7 +342,7 @@ function userPause(io, socket, consul, redisClient, channel) {
         const uuid = data.gameUUID;
         try {
             await withGameLock(uuid, async () => {
-                if (!await isActive(redisClient, uuid)) return;
+                if (!await isActive(redisClient, uuid) || await isDebugGame(redisClient, uuid)) return;
                 const auth = await handleUserAuthentication(io, data, socket, redisClient, consul);
                 if (!auth) return;
                 const paused = (await getUserPaused(redisClient, uuid)).paused;
@@ -304,6 +362,7 @@ function userPause(io, socket, consul, redisClient, channel) {
                     io.to(uuid).emit('timeRequested', remaining);
                 }
                 await setUserPaused(redisClient, uuid, paused ? 'false' : 'true');
+                await recordEvent(redisClient, uuid, {type: paused ? 'resume' : 'pause', player: {type: 'Player', id: Number(auth.UserId)}});
                 io.to(uuid).emit('isPaused', await getUserPaused(redisClient, uuid));
             });
         } catch (error) {
@@ -312,4 +371,63 @@ function userPause(io, socket, consul, redisClient, channel) {
     });
 }
 
-module.exports = {joinServer, disconnectServer, openedBubble, chatMessage, ping, userPause, listenForExpiredMessages, setupRabbitMQ};
+// A player leaves the game early (GG, WP / Tab on the client). They keep their seat in the list but
+// turns skip them; when no human player is left, the game ends.
+function leaveGame(io, socket, consul, redisClient, channel) {
+    socket.on('leaveGame', async (data = {}) => {
+        const uuid = data.gameUUID;
+        if (!uuid || !data.token) return;
+        try {
+            await withGameLock(uuid, async () => {
+                if (!await isActive(redisClient, uuid)) return;
+                const auth = await handleUserAuthentication(io, data, socket, redisClient, consul);
+                if (!auth) return;
+                const userId = Number(auth.UserId);
+                await recordEvent(redisClient, uuid, {type: 'leave', player: {type: 'Player', id: userId}});
+                const current = await getCurrentGamePlayer(redisClient, uuid);
+                const wasCurrent = current && current.type !== 'Bot' && current.id === userId;
+
+                const lobby = await getLobbyData(redisClient, uuid);
+                lobby.leftPlayers = [...new Set([...(lobby.leftPlayers || []), userId])];
+                lobby.userWS = (lobby.userWS || []).filter(user => user.id !== userId);
+                await redisClient.hSet(`Game:${uuid}`, 'LobbyData', JSON.stringify(lobby));
+                await setStatusById(userId, 'REGISTERED', await getPostgresConfig(consul));
+                if (await redisClient.get(`UserGame:${userId}`) === uuid) await redisClient.del(`UserGame:${userId}`);
+
+                const user = await getUserFromRedisByUserId(redisClient, consul, userId);
+                io.to(socket.id).emit('leftGame');
+
+                if (lobby.players.every(id => lobby.leftPlayers.includes(id))) {
+                    io.to(uuid).emit('receiveMessage', {message: `${user.username} left the game`, username: 'System'});
+                    await endGame(io, redisClient, channel, consul, uuid, 'abandoned');
+                    return;
+                }
+                // Other people still play: a bot takes the seat so the game keeps all its players.
+                const substitute = {
+                    id: `bot-for-${userId}`, username: `${user.username} (bot)`, mmr: 0, type: 'Bot',
+                    lastSuccessfulAttempt: 0, seatOf: userId, replaces: {type: 'Player', id: userId}
+                };
+                if (!lobby.bots.some(bot => bot.id === substitute.id)) lobby.bots.push(substitute);
+                await redisClient.hSet(`Game:${uuid}`, 'LobbyData', JSON.stringify(lobby));
+                await recordEvent(redisClient, uuid, {type: 'replace', player: {type: 'Player', id: userId}, by: {type: 'Bot', id: substitute.id}});
+                io.to(uuid).emit('receiveMessage', {message: `${user.username} left the game, a bot takes the seat`, username: 'System'});
+                const players = await getGamePlayers(redisClient, consul, uuid);
+                io.to(uuid).emit('playerList', players);
+                if (!wasCurrent) return;
+
+                // Close the leaver's unfinished first pick; the bot plays the rest of the turn.
+                await cancelTimer(redisClient, channel, uuid);
+                await closeUnfinishedPick(io, redisClient, uuid);
+                const next = players.find(player => player.type === 'Bot' && player.id === substitute.id);
+                await setCurrentGamePlayer(redisClient, uuid, next);
+                await recordEvent(redisClient, uuid, {type: 'turn', player: playerRef(next)});
+                io.to(uuid).emit('currentPlayer', next);
+                await continueTurn(io, redisClient, channel, consul, uuid);
+            });
+        } catch (error) {
+            emitSystemMessage(io, socket, error.message);
+        }
+    });
+}
+
+module.exports = {joinServer, disconnectServer, openedBubble, chatMessage, ping, userPause, leaveGame, listenForExpiredMessages, setupRabbitMQ};

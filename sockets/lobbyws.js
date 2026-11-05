@@ -76,7 +76,9 @@ function join(io, socket, consul, redisClient) {
                     const uuid = await redisClient.get(`UserGame:${currentUser.id}`);
                     if (uuid && await redisClient.exists(`Game:${uuid}`) &&
                         !await redisClient.hGet(`Game:${uuid}`, 'GameOver')) {
-                        throw new Error(`The user is already in Game: ${uuid}`);
+                        // The client offers a way back to the running game instead of an error.
+                        io.to(socket.id).emit('activeGame', {uuid});
+                        return;
                     }
                     await setStatusById(currentUser.id, "REGISTERED", cfg);
                 }

@@ -1,7 +1,7 @@
 const https = require('https');
 const http = require('http');
 const { Server } = require("socket.io");
-const {joinServer, disconnectServer, openedBubble, chatMessage, ping, initExpirationSubscriber, userPause,
+const {joinServer, disconnectServer, openedBubble, chatMessage, ping, initExpirationSubscriber, userPause, leaveGame,
     setupRabbitMQ, listenForExpiredMessages
 } = require("../sockets/gamews");
 
@@ -25,9 +25,10 @@ async function startGameServer(app, options, consul, redisClient, rabbitMQChanne
         joinServer(io, socket, consul, redisClient, rabbitMQChannel);
         disconnectServer(io, socket, redisClient, consul);
         openedBubble(io, socket, consul, redisClient, rabbitMQChannel);
-        chatMessage(io, socket, consul, redisClient);
+        chatMessage(io, socket, consul, redisClient, rabbitMQChannel);
         ping(socket, io);
         userPause(io, socket, consul, redisClient, rabbitMQChannel);
+        leaveGame(io, socket, consul, redisClient, rabbitMQChannel);
     });
 
     await setupRabbitMQ(rabbitMQChannel);
