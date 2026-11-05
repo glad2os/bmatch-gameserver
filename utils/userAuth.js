@@ -5,7 +5,7 @@ const {
     setUserJWT_UUID_Cache,
     updateUsersWSAtLobbyData,
     addGameWebSocketsToRedis,
-    addGameJWTsToRedis, addGameWebSocketsGuestsToRedis, incrementReadyPlayers
+    addGameJWTsToRedis, addGameWebSocketsGuestsToRedis, incrementReadyPlayers, isActivePlayer
 } = require("./getGameData");
 const {extractAndVerifyJWT} = require("./getLobbyData");
 const {setStatusById} = require("./getPostgresqlUserData");
@@ -23,7 +23,7 @@ async function handleUserAuthentication(io, data, socket, redisClient, consul) {
 
     const userFromJWT = await extractAndVerifyJWT(data.token, consul, redisClient);
     const lobbyData = await getLobbyData(redisClient, data.gameUUID);
-    const isGamePlayer = lobbyData.players.includes(userFromJWT.id);
+    const isGamePlayer = isActivePlayer(lobbyData, userFromJWT.id);
 
     if (!isGamePlayer) {
         return false;
@@ -41,7 +41,7 @@ async function authenticateNewUser(io, data, socket, redisClient, consul) {
     let lobbyData = await getLobbyData(redisClient, data.gameUUID);
     const userFromJWT = await extractAndVerifyJWT(data.token, consul, redisClient);
 
-    if (!lobbyData.players.includes(userFromJWT.id)) {
+    if (!isActivePlayer(lobbyData, userFromJWT.id)) {
         //only guests ws
         await addGameWebSocketsGuestsToRedis(redisClient, data.gameUUID, socket.id);
         return false

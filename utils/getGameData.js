@@ -2,6 +2,8 @@ const {getPostgresConfig} = require("../config/config");
 const {fetchUserById} = require("./getPostgresqlUserData");
 const consul = require("consul");
 const {setNextPlayerId} = require("../gameLogic/queue");
+const {findProgress} = require("../gameLogic/botChance");
+const {recordEvent, playerRef} = require("./gameEvents");
 const util = require("util");
 
 const {getCachedUserProfile} = require("./userProfileCache");
@@ -15,19 +17,28 @@ async function getGamePlayers(redisClient, consul, gameUUID) {
         throw new Error("No players in the game");
     }
 
+    // Players who left keep their seat (and colour on clients). While other people still play, a bot
+    // takes the seat (LobbyData.bots entry with seatOf); otherwise turns skip it.
+    const leftPlayers = gameData.leftPlayers || [];
+    const substitutes = new Map(gameData.bots.filter(bot => bot.seatOf != null).map(bot => [bot.seatOf, bot]));
     for (let id of gameData.players) {
+        if (leftPlayers.includes(id) && substitutes.has(id)) {
+            const bot = substitutes.get(id);
+            gamePlayers.push({...bot, findProgress: findProgress(bot.lastSuccessfulAttempt)});
+            continue;
+        }
         let userFromRedisByUserId = await getUserFromRedisByUserId(redisClient, consul, id);
 
         const {
             id: userId, username, mmr,
         } = userFromRedisByUserId;
 
-        const transformedUser = {id: userId, username, mmr, type: "Player"};
+        const transformedUser = {id: userId, username, mmr, type: "Player", left: leftPlayers.includes(userId)};
         gamePlayers.push(transformedUser);
     }
 
-    gameData.bots.forEach(bot => {
-        gamePlayers.push(bot);
+    gameData.bots.filter(bot => bot.seatOf == null).forEach(bot => {
+        gamePlayers.push({...bot, findProgress: findProgress(bot.lastSuccessfulAttempt)});
     });
 
     return gamePlayers;
@@ -167,10 +178,14 @@ async function setNextPlayer(redisClient, consul, gameUUID, currentUser) {
         currentIndex = currentGamePlayers.findIndex(player => player.id == currentUser.UserId);
     }
 
-    let nextPlayerIndex = setNextPlayerId(currentIndex, currentGamePlayers);
+    let nextPlayerIndex = currentIndex;
+    do {
+        nextPlayerIndex = setNextPlayerId(nextPlayerIndex, currentGamePlayers);
+    } while (currentGamePlayers[nextPlayerIndex].left && nextPlayerIndex !== currentIndex);
     let nextPlayer = currentGamePlayers[nextPlayerIndex];
 
     await setCurrentGamePlayer(redisClient, gameUUID, nextPlayer);
+    await recordEvent(redisClient, gameUUID, {type: 'turn', player: playerRef(nextPlayer)});
 
     return nextPlayer;
 }
@@ -294,7 +309,38 @@ async function updateUsersWSAtLobbyData(redisClient, lobbyData, userFromJWT, soc
     await redisClient.hSet(`Game:${gameUUID}`, 'LobbyData', JSON.stringify(lobbyData));
 }
 
+// Debug mode ("debug end" in the chat): no turn timers, every turn is played by the bot logic.
+async function isDebugGame(redisClient, gameUUID) {
+    return await redisClient.hGet(`Game:${gameUUID}`, 'Debug') === '1';
+}
+
+// Pseudo-random counter of an automatically played player: bots keep it in LobbyData.bots,
+// humans (debug mode) in LobbyData.autoplayAttempts.
+function getAutoplayCounter(lobbyData, player) {
+    if (player.type === "Bot") return lobbyData.bots.find(bot => bot.id === player.id)?.lastSuccessfulAttempt ?? 0;
+    return lobbyData.autoplayAttempts?.[player.id] ?? 0;
+}
+
+async function setAutoplayCounter(redisClient, gameUUID, player, value) {
+    if (player.type === "Bot") {
+        await setBotLastSuccessfulAttempt(redisClient, gameUUID, player.id, value);
+        return;
+    }
+    const lobbyData = await getLobbyData(redisClient, gameUUID);
+    lobbyData.autoplayAttempts = {...(lobbyData.autoplayAttempts || {}), [player.id]: value};
+    await redisClient.hSet(`Game:${gameUUID}`, 'LobbyData', JSON.stringify(lobbyData));
+}
+
+// A player of this game who has not left it.
+function isActivePlayer(lobbyData, userId) {
+    return lobbyData.players.includes(userId) && !(lobbyData.leftPlayers || []).includes(userId);
+}
+
 module.exports = {
+    isDebugGame,
+    getAutoplayCounter,
+    setAutoplayCounter,
+    isActivePlayer,
     getGamePlayers,
     setUserJWT_UUID_Cache,
     getUserJWTCache,

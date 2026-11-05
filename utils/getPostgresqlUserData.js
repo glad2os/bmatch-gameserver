@@ -18,4 +18,4 @@ async function getStatusById(userId, config) {
     const result = await getPool(config).query('SELECT status FROM users WHERE id = $1', [userId]);
     return result.rows[0]?.status ?? null;
 }
-module.exports = {fetchUserById, setStatusById, getStatusById};
+module.exports = {getPool, fetchUserById, setStatusById, getStatusById};
